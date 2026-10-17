@@ -1,0 +1,10 @@
+# Build artifacts (produced by build.sh)
+*.bin
+*.img
+
+# Python
+__pycache__/
+*.pyc
+
+# Local logs / scratch
+*.log
