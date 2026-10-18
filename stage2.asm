@@ -40,6 +40,16 @@ SCR_CELLS equ 80 * SCR_ROWS
 RAIN_FRAMES equ 170                ; how many animation frames the intro runs
 FRAME_COUNTS equ 29800             ; PIT ch0 counts per frame (~25 ms, CPU-independent)
 STAGE2_SECTORS equ 32              ; must match stage1.asm / pxe_stage1.asm (sector budget)
+; --- Fourier "epicycle" compute (the old PC's CPU does the real fixed-point maths) ---
+; The Agent preloads, into free high RAM (not part of the kernel image), a small
+; coefficient block and a sine lookup table; the kernel's E command then evaluates
+; the Fourier series (epicycle chain) in integer fixed point on this machine's CPU.
+COEF_BASE equ 0x00100000           ; header + per-epicycle {amp, wstep, phase0}
+SIN_BASE  equ 0x00120000           ; sine table: SINLEN int32 entries, Q14, [0,2pi)
+SIN_SHIFT equ 14                    ; sine table fixed-point scale = 1<<14
+SIN_MASK  equ 1023                  ; table length 1024 (power of two -> mod via AND)
+SIN_QUARTER equ 256                 ; +quarter turn = cosine
+EPI_MAX   equ 96                    ; max epicycles (bounds the reply packet)
 
 ; ================= 16-bit real mode: set up and switch =================
 stage2:
@@ -614,6 +624,8 @@ exec_line:
     je  do_out
     cmp al, 'W'
     je  do_write
+    cmp al, 'A'
+    je  do_alu
     cmp al, '?'
     je  do_help
     mov esi, s_unknown
@@ -695,6 +707,10 @@ net_loop:
     je  .do_qgeo
     cmp byte [rx_buf], 'B'         ; block write (multi-line) parsed from rx_buf
     je  .do_block
+    cmp byte [rx_buf], 'L'         ; L = bulk-load raw bytes into the compute scratch RAM
+    je  .do_load
+    cmp byte [rx_buf], 'E'         ; E = evaluate the Fourier epicycle chain at a time step
+    je  .do_epi
     ; copy rx_buf -> line_buf up to CR/LF/limit (single-line commands)
     xor esi, esi
 .cp:
@@ -882,6 +898,97 @@ net_loop:
     mov [tx_buf+12], eax
     mov word [tx_len], 16
     jmp .reply
+.do_load:
+    ; L<8hex phys addr><raw bytes> -> copy the raw bytes to physical RAM, bounded to
+    ; the compute scratch window [0x00100000, 0x00180000) so it can never scribble the
+    ; kernel, the VGA shadow, or device MMIO. Acked (reply "L") so the loader can retry.
+    cmp ecx, 9
+    jbe .poll
+    sub ecx, 9                     ; ECX = raw byte count
+    mov dword [parse_ptr], rx_buf + 1
+    mov bl, 8
+    call phex                      ; EAX = destination physical address
+    cmp eax, 0x00100000
+    jb  .poll
+    mov edx, eax
+    add edx, ecx                   ; end address
+    cmp edx, 0x00180000
+    ja  .poll
+    mov edi, eax
+    lea esi, [rx_buf+9]
+    rep movsb
+    mov byte [tx_buf], 'L'
+    mov word [tx_len], 1
+    jmp .reply
+.do_epi:
+    ; E<4hex t> -> evaluate the preloaded Fourier series at time step t, in fixed point,
+    ; and reply the (N+1) accumulated points (the chain of epicycle centres ending at the
+    ; pen tip) as little-endian int16 x,y pairs. The CPU here does all the multiply-add.
+    mov dword [parse_ptr], rx_buf + 1
+    mov bl, 4
+    call phex
+    mov [epi_t], eax               ; time step t
+    mov word [tx_len], 0
+    mov eax, [COEF_BASE + 0]        ; N = epicycle count
+    cmp eax, EPI_MAX
+    jbe .epi_nok
+    mov eax, EPI_MAX
+.epi_nok:
+    mov [epi_n], eax
+    mov eax, [COEF_BASE + 4]        ; centre X (pixels)
+    mov [epi_cx], eax
+    mov eax, [COEF_BASE + 8]        ; centre Y (pixels)
+    mov [epi_cy], eax
+    xor eax, eax
+    mov [epi_xacc], eax             ; accumulators, Q14 pixel units
+    mov [epi_yacc], eax
+    mov eax, [epi_cx]               ; point 0 = the centre
+    call emit16
+    mov eax, [epi_cy]
+    call emit16
+    xor ecx, ecx                    ; k = 0
+.epi_loop:
+    cmp ecx, [epi_n]
+    jae .epi_done
+    ; coeff ptr = COEF_BASE + 16 + k*12
+    mov eax, ecx
+    imul eax, eax, 12
+    add eax, COEF_BASE + 16
+    mov ebp, eax                    ; EBP -> {amp(0), wstep(4), phase0(8)}
+    ; idx = ((wstep * t) >> 8 + phase0) & 1023
+    mov eax, [ebp + 4]              ; wstep (Q8 table-steps per time unit, signed)
+    imul eax, [epi_t]
+    sar eax, 8
+    add eax, [ebp + 8]              ; + phase0
+    and eax, SIN_MASK               ; mod 1024 (two's complement safe for power of two)
+    mov edi, eax                    ; EDI = sin index
+    ; s = SIN[idx]
+    mov esi, [SIN_BASE + edi*4]     ; sine, Q14 signed
+    ; c = SIN[(idx + quarter) & mask]
+    lea eax, [edi + SIN_QUARTER]
+    and eax, SIN_MASK
+    mov eax, [SIN_BASE + eax*4]     ; cosine, Q14 signed
+    ; x_acc += amp * c ; y_acc += amp * s   (amp pixels, product -> Q14 pixels)
+    imul eax, [ebp + 0]             ; amp * cos
+    add [epi_xacc], eax
+    mov eax, esi
+    imul eax, [ebp + 0]             ; amp * sin
+    add [epi_yacc], eax
+    ; emit this centre point: (x_acc>>14)+CX , (y_acc>>14)+CY
+    push ecx
+    mov eax, [epi_xacc]
+    sar eax, SIN_SHIFT
+    add eax, [epi_cx]
+    call emit16
+    mov eax, [epi_yacc]
+    sar eax, SIN_SHIFT
+    add eax, [epi_cy]
+    call emit16
+    pop ecx
+    inc ecx
+    jmp .epi_loop
+.epi_done:
+    jmp .reply
 .reply:
     ; UDP_WRITE the reply back to the sender
     mov edi, pxe_param
@@ -900,6 +1007,19 @@ net_loop:
     mov ax, 0x0033                 ; PXENV_UDP_WRITE
     call pxe_call
     jmp .poll
+
+; emit16: append AX (low 16 bits of EAX) to tx_buf as a little-endian int16.
+; Standalone (non-local) so it does not disturb net_loop's local-label scope.
+emit16:
+    push ebx
+    movzx ebx, word [tx_len]
+    cmp bx, 500
+    jae .full
+    mov [tx_buf + ebx], ax
+    add word [tx_len], 2
+.full:
+    pop ebx
+    ret
 
 ; ---- C: CPUID leaf 0 vendor ----
 do_cpuid0:
@@ -1057,6 +1177,78 @@ do_write:
 .abort:
     mov esi, s_wabort
     call out_puts
+    jmp exec_done
+
+; ---- A<op><8hex a><8hex b>: the old PC's CPU computes a math problem ----
+; op is one ASCII char selecting the operation; the result (32-bit) is printed as
+; 8 hex digits. This is the machine's own ALU doing real arithmetic on demand - the
+; organism asking the hardware "what is X?" and showing the answer. ops:
+;   + add   - sub   * mul   g gcd(a,b)   s sum 1..a   f factorial a (low 32 bits)
+do_alu:
+    mov esi, [parse_ptr]
+    movzx eax, byte [esi]          ; op char (dereference parse_ptr)
+    inc esi
+    mov [parse_ptr], esi
+    mov [alu_op], al
+    mov bl, 8
+    call phex
+    mov [alu_a], eax
+    mov bl, 8
+    call phex
+    mov [alu_b], eax
+    mov al, [alu_op]
+    mov eax, [alu_a]
+    mov ebx, [alu_b]
+    cmp byte [alu_op], '+'
+    je  .add
+    cmp byte [alu_op], '-'
+    je  .sub
+    cmp byte [alu_op], '*'
+    je  .mul
+    cmp byte [alu_op], 'g'
+    je  .gcd
+    cmp byte [alu_op], 's'
+    je  .sum
+    cmp byte [alu_op], 'f'
+    je  .fact
+    mov esi, s_unknown             ; unknown op
+    call out_puts
+    jmp exec_done
+.add:
+    add eax, ebx
+    jmp .emit
+.sub:
+    sub eax, ebx
+    jmp .emit
+.mul:
+    imul eax, ebx
+    jmp .emit
+.gcd:                              ; Euclid: while b: a,b = b, a mod b
+    test ebx, ebx
+    jz  .emit
+    xor edx, edx
+    div ebx                        ; EDX = a mod b
+    mov eax, ebx
+    mov ebx, edx
+    jmp .gcd
+.sum:                              ; 1+2+...+a  (closed form a*(a+1)/2, low 32 bits)
+    mov ecx, eax
+    inc ecx
+    imul eax, ecx
+    shr eax, 1
+    jmp .emit
+.fact:                            ; a!  (low 32 bits), iterative multiply
+    mov ecx, eax
+    mov eax, 1
+.factl:
+    test ecx, ecx
+    jz  .emit
+    imul eax, ecx
+    dec ecx
+    jmp .factl
+.emit:
+    call print_hex32
+    call nl
     jmp exec_done
 
 do_help:
@@ -2579,7 +2771,8 @@ prompt    db "agent> ",0
 s_unknown db " ?",13,10,0
 s_help    db "C=cpuid-vendor F=cpuid-leaf1 I<4hex>=inb T=rtc M<8hex><2hex>=mem "
           db "P<bb><dd><f><oo>=pci O<pppp><vv>!=outb(gated) "
-          db "W<aaaaaaaa><dddddddd>!=mem/mmio-dword(gated) ?=help",13,10,0
+          db "W<aaaaaaaa><dddddddd>!=mem/mmio-dword(gated) "
+          db "A<op><aaaaaaaa><bbbbbbbb>=alu L<addr><raw>=load E<tttt>=fourier ?=help",13,10,0
 s_wok     db "write ok",13,10,0
 s_wabort  db "write aborted (need '!')",13,10,0
 s_pcihdr  db "== PCI scan  bus:dev.fn  vendor:device  class ==",13,10,0
@@ -2680,6 +2873,15 @@ tmp_port  dd 0
 tmp_val   dd 0
 tmp_addr  dd 0                     ; W command: target linear/physical address
 tmp_dw    dd 0                     ; W command: dword value to write
+alu_op    dd 0                     ; A command: operation char
+alu_a     dd 0                     ; A command: operand a
+alu_b     dd 0                     ; A command: operand b
+epi_t     dd 0                     ; E command: time step
+epi_n     dd 0                     ; E command: epicycle count
+epi_cx    dd 0                     ; E command: centre X (pixels)
+epi_cy    dd 0                     ; E command: centre Y (pixels)
+epi_xacc  dd 0                     ; E command: X accumulator (Q14 pixels)
+epi_yacc  dd 0                     ; E command: Y accumulator (Q14 pixels)
 parse_ptr dd 0
 vga_pos   dd 0
 rseed     dw 0xACE1                 ; real-mode animation PRNG seed

@@ -135,6 +135,62 @@ class HW:
             cmd += "!"
         return self.result(cmd)
 
+    # ---- compute primitives: the old PC's CPU does real work on demand ----
+    def _raw(self, payload, tries=5):
+        """Send raw bytes, return the raw reply datagram (for L/E, whose replies are
+        binary and carry no command echo). Drains stale replies, retries on loss."""
+        for _ in range(tries):
+            self.s.setblocking(False)
+            try:
+                while True:
+                    self.s.recvfrom(4096)
+            except OSError:
+                pass
+            self.s.setblocking(True)
+            self.s.settimeout(self.timeout)
+            try:
+                self.s.sendto(payload, (self.ip, self.port))
+                data, _ = self.s.recvfrom(4096)
+                return data
+            except socket.timeout:
+                continue
+        return None
+
+    def alu(self, op, a, b=0):
+        """Ask the machine's CPU to compute a math problem: A<op><8hex a><8hex b>.
+        op in '+-*' / 'g'(gcd) / 's'(sum 1..a) / 'f'(factorial a). Returns an int."""
+        r = self.result("A%s%08X%08X" % (op, a & 0xFFFFFFFF, b & 0xFFFFFFFF))
+        try:
+            return int(r, 16) if r else None
+        except ValueError:
+            return None
+
+    def load(self, addr, data, chunk=1200):
+        """Bulk-load bytes into the old PC's compute scratch RAM via the L command
+        (gated to [0x100000,0x180000)). Chunked + acked, so a lossy link can retry."""
+        off = 0
+        while off < len(data):
+            piece = data[off:off + chunk]
+            hdr = ("L%08X" % (addr + off)).encode()
+            r = self._raw(hdr + piece)
+            if not r or r[:1] != b"L":
+                return False
+            off += len(piece)
+        return True
+
+    def fourier(self, t):
+        """Evaluate the preloaded Fourier epicycle chain at time step t on the old
+        PC's CPU: E<4hex t> -> list of (x,y) int points (centre .. pen tip)."""
+        r = self._raw(("E%04X" % (t & 0xFFFF)).encode())
+        if not r:
+            return None
+        pts = []
+        for i in range(0, len(r) - 1, 4):
+            x = int.from_bytes(r[i:i + 2], "little", signed=True)
+            y = int.from_bytes(r[i + 2:i + 4], "little", signed=True)
+            pts.append((x, y))
+        return pts
+
     def mem32(self, addr):
         """Read back a plain-RAM dword (little-endian) to verify a write landed."""
         b = self.mem(addr, 4)
