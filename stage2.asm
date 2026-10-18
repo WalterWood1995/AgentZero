@@ -33,6 +33,7 @@ SCR_ROWS equ 50                    ; 80x50 text mode (small 8x8 font, fine detai
 SCR_CELLS equ 80 * SCR_ROWS
 RAIN_FRAMES equ 170                ; how many animation frames the intro runs
 FRAME_COUNTS equ 29800             ; PIT ch0 counts per frame (~25 ms, CPU-independent)
+STAGE2_SECTORS equ 32              ; must match stage1.asm / pxe_stage1.asm (sector budget)
 
 ; ================= 16-bit real mode: set up and switch =================
 stage2:
@@ -47,6 +48,12 @@ stage2:
     in  al, 0x92                   ; enable A20 via the fast gate
     or  al, 2
     out 0x92, al
+%ifdef IMAGE_DEMO
+    ; ---- image demo: switch to a VBE linear-framebuffer graphics mode now
+    ; (while BIOS VBE is fully available in real mode). Loses the text console;
+    ; the whole screen becomes a pixel surface the Agent draws photos into. ----
+    call vbe_setup
+%else
     call pit_init16                ; PIT ch0 timebase for the opening animation
 
     ; ---- opening animation (real mode: int 10h mode switches are easy here) ----
@@ -57,6 +64,7 @@ stage2:
     xor bl, bl
     int 0x10
     call anim_condense             ; the rain condenses into the face
+%endif
 
     lgdt [gdt_desc]
     mov eax, cr0
@@ -330,6 +338,114 @@ anim_condense:
 .ffd:
     ret
 
+; ================= VBE (linear framebuffer) mode set, real mode =================
+; vbe_setup: query the VBE controller, find a 32-bpp linear-framebuffer mode
+; (preferring 1024x768, else any 32-bpp LFB mode) and set it. On success stores
+; the framebuffer physical base / pitch / bpp / width / height for the PM code and
+; sets vbe_ok=1. DS=ES=0 on entry (flat low data reachable by label offset).
+vbe_setup:
+    mov byte [vbe_ok], 0
+    ; AX=4F00: VBE controller info -> vbe_info (ES:DI). Pre-seed the signature
+    ; "VBE2" so a VBE 2.0+ BIOS returns the full 512-byte extended info block.
+    mov dword [vbe_info], 'VBE2'
+    mov ax, 0x4F00
+    mov di, vbe_info
+    int 0x10
+    cmp ax, 0x004F
+    jne .fail
+    ; VideoModePtr is a real-mode far pointer at vbe_info+0x0E (off, then seg)
+    mov ax, [vbe_info+0x0E]
+    mov [vmode_off], ax
+    mov ax, [vbe_info+0x10]
+    mov [vmode_seg], ax
+    ; pass 1: exact 1024x768x32
+    mov word [want_w], 1024
+    mov word [want_h], 768
+    call vbe_scan
+    cmp word [found_mode], 0xFFFF
+    jne .haveit
+    ; pass 2: any 32-bpp LFB mode (want_w=0 = accept any resolution)
+    mov word [want_w], 0
+    call vbe_scan
+    cmp word [found_mode], 0xFFFF
+    je  .fail
+.haveit:
+    mov bx, [found_mode]
+    or  bx, 0x4000                 ; bit14 = use linear framebuffer
+    mov ax, 0x4F02
+    int 0x10
+    cmp ax, 0x004F
+    jne .fail
+    mov byte [vbe_ok], 1
+.fail:
+    ret
+
+; vbe_scan: walk the mode list at [vmode_seg]:[vmode_off]. Accept a mode that is
+; supported + graphics + has a linear framebuffer + 32 bpp, and (if want_w != 0)
+; matches want_w x want_h. On a match stores framebuffer params and the mode in
+; found_mode; otherwise found_mode = 0xFFFF.
+vbe_scan:
+    mov word [found_mode], 0xFFFF
+    mov ax, [vmode_seg]
+    mov fs, ax
+    mov bx, [vmode_off]
+.next:
+    mov cx, [fs:bx]                ; next mode number
+    add bx, 2
+    cmp cx, 0xFFFF
+    je  .done
+    push bx
+    push cx
+    ; AX=4F01: mode info for CX -> vbe_modeinfo (ES:DI, ES=0)
+    mov ax, 0x4F01
+    mov di, vbe_modeinfo
+    push fs
+    int 0x10
+    pop fs
+    pop cx
+    cmp ax, 0x004F
+    jne .cont
+    mov ax, [vbe_modeinfo]         ; ModeAttributes
+    test ax, 0x0001                ; bit0: mode supported
+    jz  .cont
+    test ax, 0x0010                ; bit4: graphics mode
+    jz  .cont
+    test ax, 0x0080                ; bit7: linear framebuffer available
+    jz  .cont
+    cmp byte [vbe_modeinfo+0x19], 32   ; BitsPerPixel
+    jne .cont
+    cmp word [want_w], 0
+    je  .match
+    mov ax, [want_w]
+    cmp [vbe_modeinfo+0x12], ax    ; XResolution
+    jne .cont
+    mov ax, [want_h]
+    cmp [vbe_modeinfo+0x14], ax    ; YResolution
+    jne .cont
+.match:
+    mov [found_mode], cx
+    mov eax, [vbe_modeinfo+0x28]   ; PhysBasePtr (LFB physical base)
+    mov [lfb_phys], eax
+    movzx eax, word [vbe_modeinfo+0x12]
+    mov [lfb_w], eax
+    movzx eax, word [vbe_modeinfo+0x14]
+    mov [lfb_h], eax
+    movzx eax, word [vbe_modeinfo+0x32]  ; LinBytesPerScanLine (VBE 3.0)
+    test eax, eax
+    jnz .pitok
+    movzx eax, word [vbe_modeinfo+0x10]  ; BytesPerScanLine (fallback)
+.pitok:
+    mov [lfb_pitch], eax
+    movzx eax, byte [vbe_modeinfo+0x19]
+    mov [lfb_bpp], eax
+    pop bx
+    ret
+.cont:
+    pop bx
+    jmp .next
+.done:
+    ret
+
 ; ================= 32-bit protected mode =================
 BITS 32
 pm_entry:
@@ -342,6 +458,9 @@ pm_entry:
     mov esp, 0x00007000            ; low stack: 0x90000 would stomp the resident
                                    ; PXE base-code/UNDI (near top of base memory)
 
+%ifdef IMAGE_DEMO
+    jmp image_demo_pm              ; graphics mode is set; go draw pixels
+%endif
     call pit_init                  ; free-running PIT ch0 timebase (QEMU==real HW)
     call uart_detect               ; is COM1 real? (K50IJ has no serial port)
     ; The opening animation already drew the face in real mode. Here we only do
@@ -1914,6 +2033,158 @@ pc_prot32:
     popad
     ret
 
+%ifdef IMAGE_DEMO
+; ================= image demo: draw into the linear framebuffer (32-bit PM) =====
+; Flat 4 GiB segments make the (high) LFB physical address directly writable.
+; The gradient shows at boot; then the Agent streams a photo over UDP with the
+; 'G' command (one block of pixels per packet) and it appears on the whole screen.
+image_demo_pm:
+    cmp byte [vbe_ok], 0
+    je  img_nofb                   ; VBE mode-set failed -> nothing to draw into
+    call draw_test                 ; gradient = "alive + graphics mode" until a photo lands
+    mov eax, [lfb_pitch]
+    mul dword [lfb_h]
+    mov [fb_size], eax             ; framebuffer byte size (for G-command bounds check)
+    ; bring up the PXE UDP channel if we network-booted (same as the text kernel)
+    cmp word [0x5008], 0x5850
+    jne img_hang                   ; no network (USB boot): just leave the gradient up
+    mov byte [pxe_present], 1
+    mov eax, [0x5000]
+    mov [rmentry], eax
+    mov edi, pxe_param             ; GET_CACHED_INFO (0x0071) -> our IP (DHCP yiaddr)
+    xor eax, eax
+    mov ecx, 32
+    rep stosd
+    mov word [pxe_param+2], 2
+    mov ax, 0x0071
+    call pxe_call
+    movzx eax, word [pxe_param+8]
+    shl eax, 4
+    movzx ecx, word [pxe_param+6]
+    add eax, ecx
+    mov edx, [eax+16]
+    mov [our_ip], edx
+    mov edi, pxe_param             ; UDP_OPEN (0x0030) bound to our IP
+    xor eax, eax
+    mov ecx, 32
+    rep stosd
+    mov eax, [our_ip]
+    mov [pxe_param+2], eax
+    mov ax, 0x0030
+    call pxe_call
+    ; fall into the image network loop
+image_net_loop:
+    call pit_init                  ; PXE may have reprogrammed the PIT
+.poll:
+    mov edi, pxe_param             ; UDP_READ into rx_buf
+    xor eax, eax
+    mov ecx, 32
+    rep stosd
+    mov eax, [our_ip]
+    mov [pxe_param+6], eax          ; dest_ip filter = our IP
+    mov word [pxe_param+12], NET_PORT   ; d_port = our listening port (50000)
+    mov word [pxe_param+14], 760        ; buffer_size (max)
+    mov word [pxe_param+16], rx_buf     ; buffer offset
+    mov word [pxe_param+18], 0          ; buffer segment
+    mov ax, 0x0032                 ; PXENV_UDP_READ
+    call pxe_call
+    cmp word [pxe_param], 0        ; Status 0 = got a packet
+    jne .poll
+    movzx ecx, word [pxe_param+14] ; received length
+    cmp byte [rx_buf], 'Q'         ; Q = query framebuffer geometry
+    je  .query
+    cmp byte [rx_buf], 'G'         ; G<8hex LFB byte offset><raw pixel bytes>
+    jne .poll
+    cmp ecx, 9                     ; need 'G' + 8 hex + at least 1 pixel byte
+    jbe .poll
+    sub ecx, 9                     ; pixel byte count
+    mov [pix_len], ecx             ; stash (phex uses edx/eax)
+    mov dword [parse_ptr], rx_buf + 1
+    mov bl, 8
+    call phex                      ; EAX = LFB byte offset
+    cmp eax, [fb_size]
+    jae .poll                      ; offset past the framebuffer -> drop
+    mov edx, [fb_size]
+    sub edx, eax                   ; bytes of room left from that offset
+    mov ecx, [pix_len]
+    cmp ecx, edx
+    jbe .okl
+    mov ecx, edx                   ; clamp so a bad packet can't write past the FB
+.okl:
+    mov edi, [lfb_phys]
+    add edi, eax
+    lea esi, [rx_buf+9]            ; pixel bytes start after 'G' + 8 hex
+    rep movsb                      ; blit into the linear framebuffer
+    jmp .poll
+.query:
+    ; reply to the sender with the real geometry: 4 LE dwords w,h,pitch,bpp.
+    ; Lets show_image.py lay pixels out with the exact pitch (no skew guesswork).
+    mov eax, [pxe_param+2]
+    mov [peer_ip], eax
+    mov ax, [pxe_param+10]
+    mov [peer_port], ax
+    mov eax, [lfb_w]
+    mov [tx_buf+0], eax
+    mov eax, [lfb_h]
+    mov [tx_buf+4], eax
+    mov eax, [lfb_pitch]
+    mov [tx_buf+8], eax
+    mov eax, [lfb_bpp]
+    mov [tx_buf+12], eax
+    mov edi, pxe_param             ; UDP_WRITE 16 bytes back
+    xor eax, eax
+    mov ecx, 32
+    rep stosd
+    mov eax, [peer_ip]
+    mov [pxe_param+2], eax          ; dest ip
+    mov [pxe_param+6], eax          ; gw = dest (real-HW UNDI quirk)
+    mov word [pxe_param+10], NET_PORT  ; src_port = our port
+    mov ax, [peer_port]
+    mov [pxe_param+12], ax          ; dst_port = sender's port
+    mov word [pxe_param+14], 16     ; 4 dwords
+    mov word [pxe_param+16], tx_buf
+    mov word [pxe_param+18], 0
+    mov ax, 0x0033                 ; PXENV_UDP_WRITE
+    call pxe_call
+    jmp .poll
+img_hang:
+    hlt
+    jmp img_hang
+img_nofb:
+    ; no framebuffer: can't show anything (text console is gone); just park.
+    hlt
+    jmp img_nofb
+
+; draw_test: full-screen gradient so a photo of the screen proves the mode,
+; resolution and framebuffer layout are correct. Pixel = BGRX (32 bpp):
+; blue = x, green = y, red = x+y.
+draw_test:
+    mov edi, [lfb_phys]            ; current scanline base
+    xor ebx, ebx                   ; y
+.row:
+    push edi
+    xor edx, edx                   ; x
+.col:
+    mov al, dl                     ; B = low bits of x
+    mov [edi], al
+    mov al, bl                     ; G = low bits of y
+    mov [edi+1], al
+    mov al, dl
+    add al, bl                     ; R = x + y
+    mov [edi+2], al
+    mov byte [edi+3], 0            ; X (unused)
+    add edi, 4
+    inc edx
+    cmp edx, [lfb_w]
+    jb  .col
+    pop edi
+    add edi, [lfb_pitch]           ; next scanline
+    inc ebx
+    cmp ebx, [lfb_h]
+    jb  .row
+    ret
+%endif
+
 ; ================= GDT (flat) =================
 align 8
 gdt_start:
@@ -2019,6 +2290,22 @@ scancode_shift:                    ; Shift held: uppercase + German-position sym
     db ' '                                                ; 39 space
     times 128-($-scancode_shift) db 0
 align 4
+; ---- VBE / framebuffer state (filled by vbe_setup in real mode) ----
+vbe_ok      db 0                   ; 1 = graphics mode set and params valid
+align 4
+lfb_phys    dd 0                   ; framebuffer physical base address
+lfb_pitch   dd 0                   ; bytes per scanline
+lfb_bpp     dd 0                   ; bits per pixel (32)
+lfb_w       dd 0                   ; width in pixels
+lfb_h       dd 0                   ; height in pixels
+fb_size     dd 0                   ; framebuffer byte size = pitch * height
+pix_len     dd 0                   ; pixel byte count of the current G packet
+vmode_off   dw 0                   ; VideoModePtr offset
+vmode_seg   dw 0                   ; VideoModePtr segment
+want_w      dw 0                   ; mode-scan target width (0 = any)
+want_h      dw 0                   ; mode-scan target height
+found_mode  dw 0xFFFF              ; matched VBE mode number (0xFFFF = none)
+align 4
 pxe_param times 128 db 0           ; PXE API parameter struct buffer (seg 0)
 s_udpopen db "UDP_OPEN ax=",0
 s_status  db " status=",0
@@ -2043,7 +2330,10 @@ col_tail  times 80 dd 0
 col_prev  times 80 dd 0
 com1_present db 0
 line_buf  times 128 db 0
+align 2
+vbe_info      times 512 db 0        ; VBE controller info block (AX=4F00)
+vbe_modeinfo  times 256 db 0        ; VBE mode info block (AX=4F01)
 
 %include "face_data.inc"            ; Dario portrait baked into the kernel
 
-    times (24*512)-($-$$) db 0
+    times (STAGE2_SECTORS*512)-($-$$) db 0

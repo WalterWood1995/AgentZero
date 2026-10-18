@@ -20,8 +20,16 @@ if command -v cygpath >/dev/null 2>&1; then          # Windows: use ASCII short 
     SRC="$(cygpath -u "$(cygpath -d "$(cygpath -w "$HERE")")")"
 fi
 
+# IMAGE_DEMO=1 builds the graphics (VBE framebuffer photo) kernel instead of the
+# default text face/chat kernel. Only stage2 differs.
+S2DEF=""
+if [ -n "${IMAGE_DEMO:-}" ]; then
+    S2DEF="-dIMAGE_DEMO"
+    echo "building IMAGE_DEMO (VBE graphics) kernel"
+fi
+
 "$NASM" -f bin "$SRC/stage1.asm" -o "$SRC/stage1.bin"
-"$NASM" -f bin "$SRC/stage2.asm" -o "$SRC/stage2.bin"
+"$NASM" -f bin $S2DEF "$SRC/stage2.asm" -o "$SRC/stage2.bin"
 "$NASM" -f bin "$SRC/pxe_stage1.asm" -o "$SRC/pxe_stage1.bin"
 cat "$HERE/stage1.bin" "$HERE/stage2.bin" > "$HERE/disk.img"          # USB / raw disk
 cat "$HERE/pxe_stage1.bin" "$HERE/stage2.bin" > "$HERE/pxe.img"       # PXE network boot

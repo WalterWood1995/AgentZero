@@ -117,12 +117,46 @@ Three real-hardware gotchas, all fixed here:
   ICMP port-unreachable that makes the *next* `recvfrom` raise `WinError 10054`. Fix — ignore
   it and keep serving.
 
+## High-res images on the framebuffer
+
+The agent can also drive the screen as a **pixel surface**, not just text. A build-time
+switch (`IMAGE_DEMO=1`) sets a **VBE linear-framebuffer graphics mode** at boot (it scans the
+VBE mode list for a 32-bpp linear-framebuffer mode, preferring 1024×768) and the kernel
+exposes two more UDP commands:
+
+| Cmd | Form | Does |
+|-----|------|------|
+| `Q` | `Q` | reply 16 bytes: framebuffer `width height pitch bpp` (little-endian) |
+| `G` | `G<8hex LFB byte offset><raw pixel bytes>` | copy pixels straight into the linear framebuffer |
+
+The dev PC does all the heavy lifting — decode, scale, BGRX conversion — and the kernel just
+copies bytes into the framebuffer (`rep movsb`, with a bounds check). `show_image.py` streams
+any photo to the bare machine, one block of pixels per UDP packet, and it fills the screen with
+no OS underneath:
+
+```bash
+IMAGE_DEMO=1 bash build.sh                       # build the graphics kernel
+python show_image.py photo.jpg 192.168.x.z       # stream it to the PXE-booted machine
+```
+
+![VBE linear-framebuffer graphics mode](docs/images/vbe-gradient.png)
+
+> *The OS-less laptop in a 1024×768×32 VBE graphics mode, drawn pixel-by-pixel into the linear
+> framebuffer. A full-screen photo streams in the same way — `show_image.py` lays it out at the
+> exact pitch and sends it over UDP. Verified end to end in QEMU and on the real Asus K50IJ.*
+
+`show_image.py` asks for the geometry with `Q` (falling back to 1024×768×32), scales to fit
+(`--cover` / `--fit` / `--stretch`), and sends a couple of idempotent passes to ride out
+dropped packets. Graphics mode replaces the text console, so the image kernel is a separate
+build from the chat terminal above.
+
 ## Build
 
 Needs [NASM](https://www.nasm.us/). Point to it with `NASM=` or have `nasm` on `PATH`:
 
 ```bash
-NASM=/path/to/nasm bash build.sh
+NASM=/path/to/nasm bash build.sh            # text face/chat kernel (default)
+IMAGE_DEMO=1 NASM=/path/to/nasm bash build.sh   # VBE graphics (image) kernel
 ```
 
 Produces `disk.img` (USB / raw disk) and `pxe.img` (PXE network boot).
@@ -183,6 +217,7 @@ Legacy/CSM mode, and go.
 Host-side tooling: `agent_repl.py` (serial), `udp_agent.py` (network), `agent_chat.py`
 (the chat answer service), `pxe_server.py` (proxyDHCP+TFTP), `ascii_art.py` /
 `gen_facedata.py` (render a photo to the ASCII avatar), `face.py` (push a face over UDP),
+`show_image.py` (stream a photo to the VBE framebuffer),
 `pxe_qemu_test.py` / `pxe_udp_test.py` / `scan_shot.py` / `matrix_shot.py` /
 `kbd_qemu_test.py` / `face_qemu_test.py` (QEMU harnesses), `burn_usb.ps1` (USB writer).
 
