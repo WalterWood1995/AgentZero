@@ -14,3 +14,7 @@ __pycache__/
 dario.jpg
 einstein.jpg
 __pycache__/
+
+# Secret: Anthropic API key / workspace id for agent_chat.py (never commit)
+api_key.txt
+workspace_id.txt
