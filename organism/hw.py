@@ -191,6 +191,30 @@ class HW:
             pts.append((x, y))
         return pts
 
+    # ---- display: show text on the old PC's screen (fire-and-forget commands) ----
+    def _disp(self, payload, repeat=4):
+        """Display commands (X/D/S/B) get no reply; the lossy link drops packets, so
+        send each a few times. They are idempotent (overwrite the same cells)."""
+        for _ in range(repeat):
+            try:
+                self.s.sendto(payload if isinstance(payload, bytes) else payload.encode(),
+                              (self.ip, self.port))
+            except OSError:
+                pass
+            time.sleep(0.02)
+
+    def disp_clear(self):
+        self._disp("X")
+
+    def disp_at(self, row, col, text):
+        """Write text at (row, col) on the screen (S command). Idempotent."""
+        self._disp("S%02X%02X%s" % (row & 0x7F, col & 0x7F, text))
+
+    def disp_lines(self, start_row, lines):
+        """Write several lines starting at start_row, one per row (B block command)."""
+        body = "\n".join(lines)
+        self._disp(("B%02X\n" % (start_row & 0x7F)).encode() + body.encode())
+
     def mem32(self, addr):
         """Read back a plain-RAM dword (little-endian) to verify a write landed."""
         b = self.mem(addr, 4)

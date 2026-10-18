@@ -178,6 +178,38 @@ framebuffer (no face/chat) for a pure full-screen photo demo.
 dropped packets. Graphics mode replaces the text console, so the image kernel is a separate
 build from the chat terminal above.
 
+## The old PC computes: a Fourier portrait
+
+The kernel doesn't just *show* things — its CPU *computes*. Three ring-0 commands turn
+the OS-less laptop into a compute unit an agent drives over UDP:
+
+| Cmd | Form | Does |
+|-----|------|------|
+| `A` | `A<op><8hex a><8hex b>` | the CPU evaluates a math problem (`+ - *`, gcd, sum, factorial) and returns the answer |
+| `L` | `L<8hex addr><raw bytes>` | bulk-load bytes into a scratch RAM window `[0x100000,0x180000)` (bounded, can't touch MMIO) |
+| `E` | `E<4hex t>` | evaluate a preloaded **Fourier series** (epicycle chain) in integer fixed point, return the chain points |
+
+The showcase is a **Fourier "epicycle" portrait of Dario**. The brain (`organism/fourier.py`)
+turns a photo into a single contour, DFTs it into rotating vectors, and quantises them to
+fixed-point coefficients plus an integer sine table. Those are `L`-loaded into the laptop's
+RAM; then **each frame the laptop's own CPU evaluates the Fourier series** (`E`) and returns
+the turning-wheel centres and the pen tip. The dev side only turns those numbers into pixels —
+the wheels, the arms, the growing pen trace (Dario's outline) and the X/Y waveforms — and blits
+the frame to the framebuffer. The maths runs on the old PC; verified bit-for-bit against a
+reference evaluator (`maxdiff = 0`), 0 dropped replies over a 120-frame run.
+
+![A Fourier epicycle portrait of Dario, computed on the OS-less laptop's CPU](docs/images/fourier-dario.png)
+
+> *Drawn on the bare-metal laptop by 64 rotating vectors. Each frame's epicycle positions are
+> computed by the laptop's own CPU in integer fixed point (`E` command); the dev PC only renders
+> the returned points. Green pen trace = the portrait outline, nested circles = the turning
+> wheels, bottom = the real/imaginary waveforms the epicycles synthesise.*
+
+This lives in `organism/` — the self-organising "cell" structure (see `organism/GENOME.md`):
+`hw.py` is the only hardware interface, `skills/` holds replayable operations
+(`cpu_math_answer.py`, `fourier_dario.py`), and `knowledge/` holds what each cell learned
+(`cpu-alu.md`, `fourier-epicycles.md`).
+
 ## Build
 
 Needs [NASM](https://www.nasm.us/). Point to it with `NASM=` or have `nasm` on `PATH`:

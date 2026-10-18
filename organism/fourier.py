@@ -92,9 +92,13 @@ def eval_ref(epicycles, cx, cy, period, t, sintab=None):
 
 # ----------------------------- image -> epicycles -----------------------------
 
-def extract_path(image_path, n_points=512, screen=(1024, 768), fill=0.78):
-    """Photo -> one ordered closed contour, resampled to n_points, scaled/centred to
-    the screen, as a complex numpy array z[n] = x + i*y (screen pixels)."""
+def extract_path(image_path, n_points=600, screen=(1024, 768), fill=0.82,
+                 max_strokes=10, crop=0.86):
+    """Photo -> one ordered path that traces the portrait's main edges, resampled to
+    n_points, scaled/centred to the screen, as a complex array z[n] = x + i*y (pixels).
+    The longest edge contours (face outline, hair, eyes, nose, mouth) are stitched into
+    a single stroke by nearest-endpoint ordering, so the epicycles draw a face, not one
+    blob. Small connecting hops between strokes are normal for Fourier line drawings."""
     import cv2
     import numpy as np
     # cv2.imread fails on non-ASCII Windows paths (e.g. "JEV 系统"); decode bytes.
@@ -102,14 +106,42 @@ def extract_path(image_path, n_points=512, screen=(1024, 768), fill=0.78):
     img = cv2.imdecode(buf, cv2.IMREAD_GRAYSCALE)
     if img is None:
         raise SystemExit("cannot read %s" % image_path)
-    img = cv2.GaussianBlur(img, (5, 5), 0)
-    edges = cv2.Canny(img, 60, 160)
-    edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
+    # focus on the central portrait, drop the busy background frame
+    h0, w0 = img.shape
+    cw, ch = int(w0 * crop), int(h0 * crop)
+    x0, y0 = (w0 - cw) // 2, (h0 - ch) // 2
+    img = img[y0:y0 + ch, x0:x0 + cw]
+    img = cv2.bilateralFilter(img, 7, 60, 60)
+    edges = cv2.Canny(img, 40, 120)
+    edges = cv2.dilate(edges, np.ones((2, 2), np.uint8), iterations=1)
     cnts, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
     if not cnts:
         raise SystemExit("no contours found")
-    cnts = sorted(cnts, key=cv2.contourArea, reverse=True)
-    pts = cnts[0].reshape(-1, 2).astype(float)       # largest contour (the outline)
+    # keep the longest few contours (by perimeter) = the strong facial edges
+    strokes = sorted(cnts, key=lambda c: cv2.arcLength(c, False), reverse=True)
+    strokes = [c.reshape(-1, 2).astype(float) for c in strokes[:max_strokes]
+               if cv2.arcLength(c, False) > 40]
+    if not strokes:
+        strokes = [max(cnts, key=cv2.arcLength).reshape(-1, 2).astype(float)]
+    # order strokes greedily by nearest endpoint, flipping each to minimise the hop;
+    # drop a stroke whose nearest endpoint is too far (avoids long stray jump lines)
+    hop_cap = 0.30 * max(cw, ch)
+    ordered = [strokes.pop(0)]
+    while strokes:
+        tail = ordered[-1][-1]
+        best, bi, bflip = 1e18, 0, False
+        for i, s in enumerate(strokes):
+            d0 = np.hypot(*(s[0] - tail))
+            d1 = np.hypot(*(s[-1] - tail))
+            if d0 < best:
+                best, bi, bflip = d0, i, False
+            if d1 < best:
+                best, bi, bflip = d1, i, True
+        s = strokes.pop(bi)
+        if best > hop_cap and len(ordered) >= 4:
+            continue                       # too far: skip this stroke, keep drawing clean
+        ordered.append(s[::-1] if bflip else s)
+    pts = np.vstack(ordered)
     # resample to n_points evenly along arc length
     seg = np.sqrt(((np.diff(pts, axis=0)) ** 2).sum(1))
     arc = np.concatenate([[0], np.cumsum(seg)])

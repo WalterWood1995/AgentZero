@@ -16,7 +16,7 @@
 # Usage:
 #   python show_image.py <image> [old-pc-ip] [--fit|--cover|--stretch]
 #          [--enter] [--exit] [--passes N] [--chunk PIXELS] [--delay SEC]
-import socket, struct, sys, time
+import os, socket, struct, sys, time
 
 try:
     from PIL import Image
@@ -26,7 +26,7 @@ except ImportError as _e:                           # let importers degrade grac
         sys.exit("needs Pillow + numpy:  pip install pillow numpy")
     raise
 
-PORT       = 50000
+PORT       = int(os.environ.get("AGENTZERO_PORT", "50000"))  # override for test QEMU
 DEF_IP     = "192.168.178.114"      # old Asus (see memory)
 DEF_W, DEF_H, DEF_PITCH, DEF_BPP = 1024, 768, 1024 * 4, 32
 

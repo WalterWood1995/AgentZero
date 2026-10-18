@@ -126,6 +126,27 @@ up) after writing.
 > You touch the metal ONLY through `hw.py`. You never write to hardware. Be concrete:
 > cite the actual bytes/dwords you read.
 
+## 5.1 Compute organs and applications
+
+The organism not only *senses* and *operates* hardware — it *computes* with it. The
+machine's own CPU is a compute organ the Agent drives on demand:
+
+- **ALU** — the kernel's `A<op><a><b>` command makes the CPU evaluate a math problem
+  (add/sub/mul, gcd, sum, factorial) and return the answer. `hw.alu(...)`.
+- **Fixed-point evaluators** — for maths too heavy to do one op at a time over the
+  link, the Agent preloads data into the machine's RAM (`hw.load`, the gated `L`
+  bulk-write bounded to a scratch window) and the kernel runs a tight integer loop on
+  the CPU. The first such evaluator is the Fourier epicycle series (`E` command,
+  `hw.fourier(t)`): the Claude brain supplies the *method* (a portrait's contour →
+  DFT → fixed-point coefficients + an integer sine table), and the old PC's CPU does
+  the real per-frame maths.
+
+An **application** is an organ system: a function composed from device-, compute-,
+and display-skills. The first application, **the Fourier portrait**, wires three
+together — the CPU computes the epicycle chain each frame (compute organ), the dev
+side turns the returned points into pixels (method/brain), and the VBE framebuffer
+shows the drawing (display organ). The brain designs; the machine runs and shows.
+
 ## 6. Why this beats an OS
 
 An OS ships generic, one-size-fits-all drivers and abstractions, carrying overhead
