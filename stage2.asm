@@ -621,6 +621,7 @@ exec_done:
 ; UDP socket already opened at boot. Poll UDP_READ; on a command packet, run it
 ; with output captured to tx_buf, then UDP_WRITE the reply back to the sender.
 NET_PORT equ 0x50C3                ; UDP port 50000, network byte order (our listen)
+RX_MAX   equ 1472                  ; max UDP payload we read (MTU 1500 - IP 20 - UDP 8)
 Q_PORT   equ 0x51C3                ; UDP port 50001, net order (dev-PC question port)
 DEVPC_IP equ 0x71B2A8C0            ; 192.168.178.113, network-byte-order bytes
 INPUT_ROW equ 48                   ; on-screen input line (left column)
@@ -660,7 +661,7 @@ net_loop:
     mov eax, [our_ip]
     mov [pxe_param+6], eax          ; dest_ip filter = our IP
     mov word [pxe_param+12], NET_PORT   ; d_port = our listening port
-    mov word [pxe_param+14], 760        ; buffer_size (max)
+    mov word [pxe_param+14], RX_MAX     ; buffer_size (max UDP payload, no IP fragmentation)
     mov word [pxe_param+16], rx_buf     ; buffer offset
     mov word [pxe_param+18], 0          ; buffer segment
     mov ax, 0x0032                 ; PXENV_UDP_READ
@@ -673,9 +674,9 @@ net_loop:
     mov ax, [pxe_param+10]
     mov [peer_port], ax
     movzx ecx, word [pxe_param+14] ; received length
-    cmp ecx, 760
+    cmp ecx, RX_MAX
     jbe .lenok
-    mov ecx, 760
+    mov ecx, RX_MAX
 .lenok:
     mov byte [rx_buf+ecx], 0       ; null-terminate the raw packet
     cmp byte [rx_buf], 'G'         ; G = blit raw pixels into the VBE framebuffer
@@ -2565,7 +2566,7 @@ peer_port dw 0                     ; last command sender's UDP port
 tx_len    dw 0
 align 4
 blk_row   dd 0                     ; current row for B (block) writes
-rx_buf    times 768 db 0           ; received command packet
+rx_buf    times 1536 db 0          ; received command packet (fits a full 1472-byte UDP read)
 tx_buf    times 512 db 0           ; reply payload
 kbd_len   dd 0
 kbd_buf   times 128 db 0           ; typed line (the user's question)

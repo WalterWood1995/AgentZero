@@ -114,7 +114,7 @@ def stream_bgrx(sock, ip, bgrx, pitch, passes=2, chunkpix=180, delay=0.0006):
     """Send a BGRX frame to the framebuffer, scanline by scanline (never spanning
     the pitch gap). Several idempotent passes ride out dropped packets."""
     h, w = bgrx.shape[0], bgrx.shape[1]
-    maxpix = min(chunkpix, 187)                       # keep each packet <= 760 bytes
+    maxpix = min(chunkpix, 360)                       # keep each packet <= 1472 bytes
     npkt = 0
     for _ in range(passes):
         for y in range(h):
@@ -135,7 +135,7 @@ def stream_bgrx(sock, ip, bgrx, pitch, passes=2, chunkpix=180, delay=0.0006):
     return npkt
 
 
-def stream_rle(sock, ip, bgrx, pitch, passes=2, delay=0.0004, maxruns=118):
+def stream_rle(sock, ip, bgrx, pitch, passes=2, delay=0.0004, maxruns=240):
     """Run-length-encode the frame and send it. A flat page (text / reader view) is
     mostly long runs of one colour, so this is far fewer packets than raw G pixels.
     Packet: 'Z' + 8hex start LFB offset + runs of count(2 LE) + pixel(4 LE BGRX).
