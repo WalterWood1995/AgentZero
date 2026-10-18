@@ -94,13 +94,25 @@ screen, with a graceful fall-back to canned replies when no key is set. Put the 
 `ANTHROPIC_API_KEY` or a gitignored `api_key.txt` (org-scoped keys also need
 `ANTHROPIC_WORKSPACE_ID` / `workspace_id.txt`).
 
-It also **shows web pages**: type `web <domain>` on the machine's own keyboard (e.g.
-`web en.wikipedia.org`, all lowercase + a dot, so no Shift keys are needed) and the dev PC
-screenshots the page with headless Chrome and streams it to the laptop's framebuffer — the
-real homepage, full-screen, with no OS and no browser on the machine (see *A graphics console*
-below). Type anything to drop back to the face. From the dev PC: `python show_image.py <img>`
-or `python webshot.py <url>`. (The older text-digest browser, `web.py`, boils a page down to a
-Claude summary instead.)
+It also has a **bare-metal web reader**. Type `web <domain>` on the machine's own keyboard
+(e.g. `web en.wikipedia.org/wiki/albert_einstein`, lowercase, so no Shift keys are needed) and
+the dev PC fetches the page, pulls out the title, text, images and links, lays them out as
+clean reader pages (not a screenshot — a reflowed view with the real images), and streams them
+to the laptop's framebuffer. Then you navigate it entirely from the machine's own keyboard:
+
+| Key | Does |
+|-----|------|
+| `j` / `k` | move the link cursor (a red ▶) down / up, auto-paging to the links |
+| `space` / `f` | follow the selected link (loads that page) |
+| `n` / `p` | next / previous page |
+| `q` | back to the face |
+
+Keys act *per-keystroke* (the kernel sends each key as it is pressed while a page is shown, not
+line-buffered), so it feels like a real browser. Dev-PC pieces: `webread.py` (parse + lay out),
+`show_image.py` (RLE framebuffer blits — a reader page is mostly flat colour, so it compresses
+to a few hundred packets and lands in ~2 s), and `agent_chat.py` routes the keys. For a raw
+full-page screenshot instead, `shot <domain>` (via `webshot.py` + headless Chrome). The older
+text-digest browser, `web.py`, boils a page down to a Claude summary.
 
 **Talking face**: the dev PC reads each answer aloud through Windows SAPI (an English voice),
 and while it speaks, `face_anim.py` flaps the ASCII portrait's mouth on the screen with

@@ -636,8 +636,10 @@ net_loop:
     mov dword [kbd_buf], 'hell'
     mov byte  [kbd_buf+4], 'o'
     mov dword [kbd_len], 5
+%ifndef NO_HELLO
     call send_question
     call send_question
+%endif
     mov dword [kbd_len], 0
 .poll:
     ; drain the PS/2 keyboard fully this iteration (no overflow/beep on fast
@@ -678,6 +680,8 @@ net_loop:
     mov byte [rx_buf+ecx], 0       ; null-terminate the raw packet
     cmp byte [rx_buf], 'G'         ; G = blit raw pixels into the VBE framebuffer
     je  .do_gblit
+    cmp byte [rx_buf], 'Z'         ; Z = RLE-blit (fast for text/reader pages)
+    je  .do_zblit
     cmp byte [rx_buf], 'V'         ; V = switch display into graphics mode (show image)
     je  .do_gfxon
     cmp byte [rx_buf], 'U'         ; U = back to text mode + redraw the face
@@ -828,6 +832,40 @@ net_loop:
     lea esi, [rx_buf+9]
     rep movsb
     jmp .poll
+.do_zblit:                         ; Z<8hex LFB offset><runs: count(2 LE)+pixel(4)...>
+    cmp ecx, 15                    ; need 'Z' + 8 hex + >=1 run (6 bytes) = 15 bytes
+    jb  .poll
+    mov byte [gfx_mode], 1
+    add ecx, rx_buf                ; absolute end of the run stream
+    mov [z_end], ecx
+    mov dword [parse_ptr], rx_buf + 1
+    mov bl, 8
+    call phex                      ; EAX = start LFB byte offset
+    cmp eax, [fb_size]
+    jae .poll
+    mov edi, [lfb_phys]
+    add edi, eax                   ; EDI = dest pixel
+    mov edx, [lfb_phys]
+    add edx, [fb_size]             ; EDX = framebuffer end (bound)
+    lea esi, [rx_buf+9]            ; ESI = run stream
+.zrun:
+    cmp esi, [z_end]
+    jae .poll                      ; all runs consumed
+    movzx ecx, word [esi]          ; run length (pixels)
+    add esi, 2
+    mov eax, [esi]                 ; run pixel (BGRX)
+    add esi, 4
+    mov ebx, edx                   ; clamp count to room left in the framebuffer
+    sub ebx, edi
+    shr ebx, 2
+    cmp ecx, ebx
+    jbe .zok
+    mov ecx, ebx
+.zok:
+    test ecx, ecx
+    jz  .poll
+    rep stosd                      ; write ECX copies of EAX at [EDI]
+    jmp .zrun
 .do_qgeo:                          ; Q: reply 4 LE dwords w,h,pitch,bpp
     mov eax, [lfb_w]
     mov [tx_buf+0], eax
@@ -1476,7 +1514,24 @@ kbd_service:
 ; kbd_char: handle a typed character in AL (echo on the input line; Enter sends).
 kbd_char:
     pushad
-    mov byte [need_present], 1      ; a keystroke changed the input line -> repaint console
+    cmp byte [gfx_mode], 0          ; a full-screen image/reader page is up?
+    je  .console
+    ; reader/image mode: send each printable key to the dev PC IMMEDIATELY (per-key
+    ; navigation) with no echo or line buffering, so 'j'/'k'/'f'/'n'/'q' act at once.
+    cmp al, 32
+    jb  .done                       ; ignore Enter/backspace while a page is shown
+    inc byte [kbd_seq]              ; a per-keypress sequence number so the dev PC can
+    mov [kbd_buf], al               ; dedup the redundant copies (char + seq = 2 bytes)
+    mov bl, [kbd_seq]
+    mov [kbd_buf+1], bl
+    mov dword [kbd_len], 2
+    call send_question              ; send a few times - this UNDI stack drops single
+    call send_question              ; UDP packets, and one lost key would strand the
+    call send_question              ; user on the page; the dev PC dedups by seq
+    mov dword [kbd_len], 0
+    jmp .done
+.console:
+    mov byte [need_present], 1      ; console/chat: line-based, echo, repaint on change
     cmp al, 13
     je  .enter
     cmp al, 8
@@ -2560,8 +2615,10 @@ lfb_w       dd 0                   ; width in pixels
 lfb_h       dd 0                   ; height in pixels
 fb_size     dd 0                   ; framebuffer byte size = pitch * height
 pix_len     dd 0                   ; pixel byte count of the current G packet
+z_end       dd 0                   ; end pointer of the current Z (RLE) run stream
 gfx_mode    db 0                   ; 1 = a full-screen image is shown (text hidden)
 need_present db 0                  ; 1 = text buffer changed, repaint the console next poll
+kbd_seq     db 0                   ; per-keypress sequence (for dedup of redundant key sends)
 align 4
 saved_int10 dd 0                   ; BIOS INT 10h vector saved at boot (offset:segment)
 ; ---- graphics text console state ----

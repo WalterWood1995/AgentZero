@@ -20,8 +20,9 @@ import time
 try:
     import show_image                              # stream a photo to the VBE framebuffer
     import webshot                                 # screenshot a web page with headless Chrome
+    import webread                                 # parse a page into reader pages (text+images+links)
 except Exception as _e:                            # keep chat working even if these fail to import
-    show_image = webshot = None
+    show_image = webshot = webread = None
     print("image display unavailable (%r)" % _e, flush=True)
 
 Q_PORT = 50001          # we listen here (questions from the old PC)
@@ -99,7 +100,8 @@ def _client_get():
         wsid = _workspace_id()
         if wsid:                                 # org-scoped keys need the workspace header
             headers["anthropic-workspace-id"] = wsid
-        _client = anthropic.Anthropic(api_key=key, default_headers=headers or None)
+        _client = anthropic.Anthropic(api_key=key, default_headers=headers or None,
+                                      timeout=15, max_retries=0)
         print("Claude backend ready (model %s%s)"
               % (MODEL, ", workspace " + wsid if wsid else ""), flush=True)
     except Exception as e:
@@ -125,6 +127,7 @@ def llm_answer(q):
         msg = c.messages.create(
             model=MODEL, max_tokens=256, system=SYSTEM,
             messages=[{"role": "user", "content": q}],
+            timeout=15,                              # never let a slow API stall the loop
         )
         text = "".join(getattr(b, "text", "") for b in msg.content
                         if getattr(b, "type", "") == "text")
@@ -151,6 +154,8 @@ def answer(q):
     if not q:
         return "..."
     low = q.lower()
+    if low in ("hi", "hello", "hey"):        # fast path (the kernel auto-sends 'hello'
+        return _canned(q)                    # at boot; never call the LLM for it)
     # "web <domain>" / "go <domain>" -> fetch that page and show a screen digest
     if low.startswith("web ") or low.startswith("go "):
         target = q.split(None, 1)[1].strip() if len(q.split(None, 1)) > 1 else ""
@@ -163,13 +168,60 @@ def answer(q):
     return llm_answer(q) or _canned(q)
 
 
-# ---- image display: show web-page screenshots / photos on the old PC's screen ----
-# A separate UDP socket for V/U/display sends (the kernel's acks come back here, not
-# to the question listener). _showing tracks whether the screen is on an image.
+# ---- web reader + image display on the old PC's screen ----
+# A separate UDP socket for display sends (the kernel's acks come back here, not to
+# the question listener). _showing = a full-screen image/page is up; _reader holds
+# the current parsed page's rendered pages + numbered links for keyboard navigation.
 _disp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 _disp.settimeout(1.5)
 _showing = {"on": False}
-IMG_VERBS = ("web ", "pic ", "img ", "show ", "bild ", "seite ")   # all lowercase, no Shift
+_reader = {"pages": None, "links": [], "cur": 0, "url": "", "pil": None, "sel": None}
+_kseq = {"v": None}                                # last per-key sequence byte (dedup)
+_disp_lock = threading.Lock()                      # serialize framebuffer sends
+_loading = {"on": False}                           # a page is being fetched/rendered
+WEB_VERBS = ("web ", "read ", "seite ", "lies ")   # all lowercase, no Shift -> reader
+SHOT_VERBS = ("shot ", "pic ", "bild ")            # full-page screenshot instead
+R_MARGIN = 40                                      # must match webread.MARGIN (cursor column)
+
+
+def _links_on_page(p):
+    return [i for i, l in enumerate(_reader["links"]) if l["page"] == p]
+
+
+def _draw_cursor(peer, idx, marked):
+    """Blit the left-margin band at link `idx`, with or without the > marker."""
+    if idx is None or _reader["pil"] is None:
+        return
+    link = _reader["links"][idx]
+    y0 = max(0, link["y0"] - 4)
+    band = _reader["pil"].crop((0, y0, R_MARGIN, y0 + 30)).convert("RGB")
+    if marked:
+        from PIL import ImageDraw
+        ImageDraw.Draw(band).polygon([(10, 5), (10, 25), (31, 15)], fill=(210, 30, 30))
+    show_image.blit_at(peer, band, 0, y0, sock=_disp)
+
+
+def _move_cursor(peer, delta):
+    """Move the link cursor by delta across the whole document, auto-paging to the
+    link's page if it is on a different one."""
+    links = _reader["links"]
+    if not links:
+        return
+    cur = _reader["sel"]
+    new = (0 if delta > 0 else len(links) - 1) if cur is None else cur + delta
+    if new < 0 or new >= len(links):
+        return
+    with _disp_lock:
+        if links[new]["page"] != _reader["cur"]:      # cursor moved to another page
+            _reader["cur"] = links[new]["page"]
+            _reader["pil"] = _reader["pages"][_reader["cur"]]
+            show_image.blit_frame(peer, _reader["pil"], rle=True, passes=4, delay=0.0007, sock=_disp)
+            _reader["sel"] = new
+            _draw_cursor(peer, new, True)
+        else:
+            _draw_cursor(peer, cur, False)            # same page: just move the marker
+            _reader["sel"] = new
+            _draw_cursor(peer, new, True)
 
 
 def _send_text(sock, peer, a, q=None):
@@ -187,20 +239,64 @@ def _send_text(sock, peer, a, q=None):
         sock.sendto(payload.encode("latin1"), (peer, R_PORT))
 
 
-def show_page(peer, target):
-    """Screenshot `target` and stream it full-screen to the old PC (graphics mode)."""
-    png = webshot.screenshot(target)
-    show_image.show(png, peer, mode="cover", enter=not _showing["on"],
-                    passes=3, delay=0.0008)
+def _blit_page(peer):
+    """Blit the current reader page, then place the cursor on its first link."""
+    pages = _reader["pages"]
+    if not pages:
+        return
+    p = _reader["cur"]
+    _reader["pil"] = pages[p]
+    show_image.blit_frame(peer, pages[p], rle=True, passes=4, delay=0.0007, sock=_disp)
     _showing["on"] = True
+    onp = _links_on_page(p)
+    _reader["sel"] = onp[0] if onp else None
+    if _reader["sel"] is not None:
+        _draw_cursor(peer, _reader["sel"], True)
+
+
+def open_url(peer, url):
+    """Fetch + render a page in the BACKGROUND (news pages take several seconds), so
+    the service stays responsive to navigation while it loads. Shows it when ready."""
+    if webread is None:
+        return False
+    if "://" not in url:
+        url = "https://" + url
+    if _loading["on"]:
+        return True                                  # already loading one; ignore
+    _loading["on"] = True
+
+    def _work():
+        try:
+            pages, links = webread.render(url)
+            _reader.update(pages=pages, links=links, cur=0, url=url)
+            with _disp_lock:
+                _blit_page(peer)
+            print("reader: %s  (%d pages, %d links)" % (url, len(pages), len(links)), flush=True)
+        except Exception as e:
+            print("webread error: %r" % e, flush=True)
+        finally:
+            _loading["on"] = False
+
+    threading.Thread(target=_work, daemon=True).start()
+    return True
+
+
+def show_shot(peer, target):
+    """Full-page screenshot (not reflowed) streamed to the screen."""
+    png = webshot.screenshot(target)
+    show_image.show(png, peer, mode="cover", passes=3, delay=0.0008)
+    _showing["on"] = True
+    _reader["pages"] = None
 
 
 def back_to_face(peer):
-    """Leave graphics mode and redraw the face (if an image is currently shown)."""
+    """Drop any image/reader page and repaint the face/chat console."""
+    _reader["pages"] = None
     if _showing["on"] and show_image is not None:
-        show_image.exit_graphics(_disp, peer)
+        with _disp_lock:
+            show_image.exit_graphics(_disp, peer)    # sends U (repaint the console)
         _showing["on"] = False
-        time.sleep(0.4)                              # let the mode switch + face redraw settle
+        time.sleep(0.4)
 
 
 # ---- the talking face: speak each answer on the dev PC (Windows SAPI), and
@@ -293,21 +389,56 @@ def main():
             _last_peer[0] = peer                 # the old PC, for the talking-face mouth
             low = q.strip().lower()
 
-            # --- image command: "web <domain>" etc. -> screenshot the page, show it ---
-            verb = next((v for v in IMG_VERBS if low.startswith(v)), None)
+            # --- reader navigation: a parsed page is up; each keystroke arrives alone
+            # (the kernel sends per-key while a page is shown). Move a cursor over the
+            # links, follow the selected one, page, or quit. ---
+            if _reader["pages"] is not None and webread is not None:
+                ch = q[:1].lower()
+                seq = q[1] if len(q) >= 2 else None   # dedup the kernel's redundant copies
+                if seq is not None and seq == _kseq["v"]:
+                    continue
+                _kseq["v"] = seq
+                if ch == "j":                        # cursor down (next link)
+                    _move_cursor(peer, +1)
+                elif ch == "k":                      # cursor up (prev link)
+                    _move_cursor(peer, -1)
+                elif ch in (" ", "f", "g"):          # follow the selected link
+                    if _reader["sel"] is not None:
+                        open_url(peer, _reader["links"][_reader["sel"]]["url"])
+                elif ch == "n":                      # next page
+                    if _reader["cur"] < len(_reader["pages"]) - 1:
+                        _reader["cur"] += 1; _blit_page(peer)
+                elif ch == "p":                      # previous page
+                    if _reader["cur"] > 0:
+                        _reader["cur"] -= 1; _blit_page(peer)
+                elif ch == "q":                      # quit back to the face
+                    back_to_face(peer)
+                continue                             # reader mode consumes every key
+
+            # --- web/read <domain> -> parse the page and show it (text + images + links) ---
+            verb = next((v for v in WEB_VERBS if low.startswith(v)), None)
+            if verb and webread is not None:
+                target = q.split(None, 1)[1].strip() if len(q.split(None, 1)) > 1 else ""
+                if target:
+                    if not open_url(peer, target):
+                        back_to_face(peer)
+                        _send_text(s, peer, "could not load " + target)
+                    continue
+
+            # --- shot/pic <domain> -> full-page screenshot (not reflowed) ---
+            verb = next((v for v in SHOT_VERBS if low.startswith(v)), None)
             if verb and show_image is not None and webshot is not None:
                 target = q.split(None, 1)[1].strip() if len(q.split(None, 1)) > 1 else ""
                 if target:
                     try:
-                        show_page(peer, target)
-                        print("showing %r on %s" % (target, peer), flush=True)
+                        show_shot(peer, target)
                     except Exception as e:
                         print("webshot error: %r" % e, flush=True)
                         back_to_face(peer)
                         _send_text(s, peer, "could not load " + target)
                     continue
 
-            # --- any other input while an image is up: return to the face first ---
+            # --- any other input while an image/page is up: return to the face first ---
             if _showing["on"]:
                 back_to_face(peer)
                 if low in ("", "back", "face", "home", "weiter", "zurueck", "zuruck", "ok"):
