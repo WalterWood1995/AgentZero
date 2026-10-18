@@ -63,6 +63,44 @@ Each command is one line; the reply ends with CRLF.
 `O` is the only write. Everything else is read-only probing; the mandatory `!` confirm
 byte keeps an agent from firing a dangerous port write by accident.
 
+The agent also drives the screen directly with display commands (no reply):
+
+| Cmd | Form | Does |
+|-----|------|------|
+| `X` / `R` | `X` / `R` | clear the screen / resume ambient rain |
+| `D` | `D<text>` | write a line |
+| `S` | `S<2hex row><2hex col><text>` | write text at (row, col), idempotent |
+| `B` | `B<2hex startrow>⏎<lines>` | block write: each line at (startrow + i, 0) |
+
+## The agent chat terminal
+
+Beyond one-letter probes, AgentZero runs as a full **network chat terminal** — the machine
+becomes the agent's face and keyboard, with no OS underneath:
+
+- It boots into a **portrait avatar** rendered as ASCII (baked into the kernel as
+  `face_data.inc`, rendered from a photo by `gen_facedata.py`) on the right, after a Matrix
+  rain intro that zooms and condenses into the face.
+- You **type a question on the machine's own keyboard** — a from-scratch PS/2 8042 driver
+  (German QWERTZ map, hardware text cursor). Keystrokes leave the box as raw UDP.
+- A service on the dev PC answers and sends the text back; the kernel paints it on the
+  **left** while the face stays on the right.
+
+```bash
+python agent_chat.py     # dev PC: answers questions on UDP 50001, replies to :50000
+```
+
+Three real-hardware gotchas, all fixed here:
+
+- **The BIOS steals your keystrokes.** Polling the 8042 from protected mode drops keys: the
+  PXE UDP calls briefly return to real mode with interrupts on, and the real-mode BIOS
+  INT 09h handler reads port 0x60 first. Fix — disable the keyboard IRQ1 (8042 command-byte
+  bit 0) and mask IRQ1 at the PIC, so scancodes wait in the output buffer for the poll.
+- **`PXENV_UDP_WRITE` sends nowhere with `gw = 0`** on this old UNDI stack, even on-subnet.
+  Fix — set the gateway field to the destination IP.
+- **Windows kills the UDP service on reply.** `sendto` to a port with no listener returns an
+  ICMP port-unreachable that makes the *next* `recvfrom` raise `WinError 10054`. Fix — ignore
+  it and keep serving.
+
 ## Build
 
 Needs [NASM](https://www.nasm.us/). Point to it with `NASM=` or have `nasm` on `PATH`:
@@ -126,16 +164,19 @@ Legacy/CSM mode, and go.
   back to PM). Timing uses the free-running PIT channel 0, so animations run at the same
   speed in QEMU and on real silicon.
 
-Host-side tooling: `agent_repl.py` (serial), `udp_agent.py` (network), `pxe_server.py`
-(proxyDHCP+TFTP), `pxe_qemu_test.py` / `pxe_udp_test.py` / `scan_shot.py` / `matrix_shot.py`
-(QEMU harnesses), `burn_usb.ps1` (USB writer).
+Host-side tooling: `agent_repl.py` (serial), `udp_agent.py` (network), `agent_chat.py`
+(the chat answer service), `pxe_server.py` (proxyDHCP+TFTP), `ascii_art.py` /
+`gen_facedata.py` (render a photo to the ASCII avatar), `face.py` (push a face over UDP),
+`pxe_qemu_test.py` / `pxe_udp_test.py` / `scan_shot.py` / `matrix_shot.py` /
+`kbd_qemu_test.py` / `face_qemu_test.py` (QEMU harnesses), `burn_usb.ps1` (USB writer).
 
 ## Status
 
 Proven end to end on real hardware: an agent on a PC driving a bare-metal Asus K50IJ over
-the LAN, reading its real chipset live. The network command channel still has a reliability
-rough edge (some UDP replies can be dropped under the current polling cadence) that's next
-on the list. Treat this as a working research kernel, not production.
+the LAN, reading its real chipset live — and now a full chat terminal, where you type a
+question on the laptop's own keyboard and the agent answers on its screen, all with no OS.
+Display is driven by idempotent positioned/block writes, which fixed the earlier
+packet-drop rough edge. Treat this as a working research kernel, not production.
 
 ## License
 

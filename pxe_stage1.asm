@@ -14,7 +14,7 @@
 BITS 16
 ORG 0x7C00
 
-STAGE2_BYTES equ 16 * 512           ; stage2 is padded to 16 sectors
+STAGE2_BYTES equ 24 * 512           ; stage2 is padded to 24 sectors
 
 ; Scratch block at physical 0x5000 (free low memory) hands the PXE entry info to
 ; stage2 after it switches to protected mode:

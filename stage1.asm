@@ -12,7 +12,7 @@ ORG 0x7C00
 
 STAGE2_SEG equ 0x0000
 STAGE2_OFF equ 0x8000
-STAGE2_SECTORS equ 16          ; read 16 sectors (8 KiB) of stage2
+STAGE2_SECTORS equ 24          ; read 24 sectors (12 KiB) of stage2 (holds face data)
 STAGE2_LBA equ 1               ; stage2 starts right after this boot sector
 
 start:

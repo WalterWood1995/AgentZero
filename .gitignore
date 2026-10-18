@@ -8,3 +8,9 @@ __pycache__/
 
 # Local logs / scratch
 *.log
+
+# Source portrait photos (real people) - not redistributed; the kernel ships
+# only the derived ASCII (face_data.inc). Supply your own photo to gen_facedata.py.
+dario.jpg
+einstein.jpg
+__pycache__/
