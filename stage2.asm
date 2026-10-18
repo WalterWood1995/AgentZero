@@ -997,6 +997,10 @@ net_loop:
     rep stosd
     mov eax, [peer_ip]
     mov [pxe_param+2], eax          ; dest ip
+    mov [pxe_param+6], eax          ; gw = dest: old UNDI stacks drop UDP_WRITE when
+                                    ; the gateway field is 0, even on-link (m9 quirk).
+                                    ; Without this, command replies vanish on real HW
+                                    ; (QEMU's SLIRP tolerates gw=0, so this passed there).
     mov word [pxe_param+10], NET_PORT  ; src_port = our port
     mov ax, [peer_port]
     mov [pxe_param+12], ax          ; dst_port = sender's port

@@ -165,15 +165,28 @@ class HW:
         except ValueError:
             return None
 
-    def load(self, addr, data, chunk=1200):
+    def load(self, addr, data, chunk=512, verify=True):
         """Bulk-load bytes into the old PC's compute scratch RAM via the L command
-        (gated to [0x100000,0x180000)). Chunked + acked, so a lossy link can retry."""
+        (gated to [0x100000,0x180000)). Small chunks ride the lossy real-metal link.
+        On real hardware the 1-byte 'L' ack is frequently dropped even though the
+        write itself lands (the gated rep-movsb is reliable), so we also accept a
+        readback match as success rather than failing the whole load on a lost ack."""
         off = 0
         while off < len(data):
             piece = data[off:off + chunk]
             hdr = ("L%08X" % (addr + off)).encode()
-            r = self._raw(hdr + piece)
-            if not r or r[:1] != b"L":
+            ok = False
+            for _ in range(4):
+                r = self._raw(hdr + piece, tries=1)
+                if r and r[:1] == b"L":
+                    ok = True
+                    break
+                if verify:                       # ack lost? trust a readback match
+                    n = min(len(piece), 32)
+                    if self.mem(addr + off, n) == piece[:n]:
+                        ok = True
+                        break
+            if not ok:
                 return False
             off += len(piece)
         return True
