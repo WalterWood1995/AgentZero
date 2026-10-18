@@ -94,10 +94,13 @@ screen, with a graceful fall-back to canned replies when no key is set. Put the 
 `ANTHROPIC_API_KEY` or a gitignored `api_key.txt` (org-scoped keys also need
 `ANTHROPIC_WORKSPACE_ID` / `workspace_id.txt`).
 
-It also has a tiny **browser skill**: type `web <domain>` on the machine's own keyboard
-(e.g. `web en.wikipedia.org`, all lowercase + a dot, so no Shift keys are needed) and the
-page is fetched, boiled down by Claude, and painted on the left of the screen. From the dev
-PC: `python web.py <url>`.
+It also **shows web pages**: type `web <domain>` on the machine's own keyboard (e.g.
+`web en.wikipedia.org`, all lowercase + a dot, so no Shift keys are needed) and the dev PC
+screenshots the page with headless Chrome and streams it to the laptop's framebuffer — the
+real homepage, full-screen, with no OS and no browser on the machine (see *A graphics console*
+below). Type anything to drop back to the face. From the dev PC: `python show_image.py <img>`
+or `python webshot.py <url>`. (The older text-digest browser, `web.py`, boils a page down to a
+Claude summary instead.)
 
 **Talking face**: the dev PC reads each answer aloud through Windows SAPI (an English voice),
 and while it speaks, `face_anim.py` flaps the ASCII portrait's mouth on the screen with
@@ -117,27 +120,40 @@ Three real-hardware gotchas, all fixed here:
   ICMP port-unreachable that makes the *next* `recvfrom` raise `WinError 10054`. Fix — ignore
   it and keep serving.
 
-## High-res images on the framebuffer
+## A graphics console
 
-The agent can also drive the screen as a **pixel surface**, not just text. A build-time
-switch (`IMAGE_DEMO=1`) sets a **VBE linear-framebuffer graphics mode** at boot (it scans the
-VBE mode list for a 32-bpp linear-framebuffer mode, preferring 1024×768) and the kernel
-exposes two more UDP commands:
+The chat terminal doesn't use VGA text mode — it runs as a **graphics console**. Right after
+the (unchanged) text-mode boot animation, the kernel switches into a **VBE linear-framebuffer
+mode** (it scans the VBE mode list for a 32-bpp LFB mode, preferring 1024×768) *once*, in real
+mode, where the old hardware actually honours it. From then on the display never changes mode:
+
+- The existing text code still writes `char + attr` cells, but to a **RAM shadow buffer**, and
+  a software renderer (`present_text`) paints that buffer into the framebuffer using the BIOS
+  **8×8 ROM font** (grabbed at boot via INT 10h `AX=1130`). The face and dialogue you see are
+  pixels, drawn glyph by glyph.
+- **Images blit straight in.** The dev PC does the heavy lifting (decode, scale, BGRX), and the
+  kernel just copies pixel bytes into the framebuffer. So `web <domain>` paints the real page
+  full-screen over the console; type anything and it repaints the face.
+
+Why a console instead of switching modes on demand? This 2009 GMA won't set a VBE mode at
+*runtime* (from protected mode, after the PXE stack is up) — only the boot-time switch sticks.
+Rendering everything as pixels in one mode sidesteps that and is rock-solid on the real laptop.
+
+UDP commands added for the console:
 
 | Cmd | Form | Does |
 |-----|------|------|
+| `G` | `G<8hex LFB byte offset><raw pixel bytes>` | blit pixels into the framebuffer (shows an image) |
+| `U` | `U` | drop the image, repaint the text/face console |
 | `Q` | `Q` | reply 16 bytes: framebuffer `width height pitch bpp` (little-endian) |
-| `G` | `G<8hex LFB byte offset><raw pixel bytes>` | copy pixels straight into the linear framebuffer |
-
-The dev PC does all the heavy lifting — decode, scale, BGRX conversion — and the kernel just
-copies bytes into the framebuffer (`rep movsb`, with a bounds check). `show_image.py` streams
-any photo to the bare machine, one block of pixels per UDP packet, and it fills the screen with
-no OS underneath:
 
 ```bash
-IMAGE_DEMO=1 bash build.sh                       # build the graphics kernel
-python show_image.py photo.jpg 192.168.x.z       # stream it to the PXE-booted machine
+python show_image.py photo.jpg 192.168.x.z       # stream any photo to the laptop
+python webshot.py example.com shot.png           # screenshot a page (headless Chrome)
 ```
+
+A separate `IMAGE_DEMO=1 bash build.sh` builds a minimal kernel that boots *straight* into the
+framebuffer (no face/chat) for a pure full-screen photo demo.
 
 ![VBE linear-framebuffer graphics mode](docs/images/vbe-gradient.png)
 
@@ -217,7 +233,7 @@ Legacy/CSM mode, and go.
 Host-side tooling: `agent_repl.py` (serial), `udp_agent.py` (network), `agent_chat.py`
 (the chat answer service), `pxe_server.py` (proxyDHCP+TFTP), `ascii_art.py` /
 `gen_facedata.py` (render a photo to the ASCII avatar), `face.py` (push a face over UDP),
-`show_image.py` (stream a photo to the VBE framebuffer),
+`show_image.py` (stream a photo to the framebuffer), `webshot.py` (screenshot a page),
 `pxe_qemu_test.py` / `pxe_udp_test.py` / `scan_shot.py` / `matrix_shot.py` /
 `kbd_qemu_test.py` / `face_qemu_test.py` (QEMU harnesses), `burn_usb.ps1` (USB writer).
 

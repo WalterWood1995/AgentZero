@@ -27,7 +27,11 @@ ORG 0x8000
 COM1 equ 0x3F8
 CODE_SEL equ 0x08
 DATA_SEL equ 0x10
-VGA      equ 0xB8000
+VGA      equ 0x00020000            ; PM text console: a RAM shadow (80x50 char+attr cells).
+                                   ; In the VBE graphics mode the legacy 0xB8000 text buffer
+                                   ; isn't displayable, so the console lives in plain RAM and
+                                   ; present_text renders it to the framebuffer as pixels.
+                                   ; (The real-mode boot animation still uses VGASEG=0xB800.)
 VGA_ATTR equ 0x0A                  ; black background, bright green foreground
 SCR_ROWS equ 50                    ; 80x50 text mode (small 8x8 font, fine detail)
 SCR_CELLS equ 80 * SCR_ROWS
@@ -43,6 +47,11 @@ stage2:
     mov es, ax
     mov ss, ax
     mov sp, 0x7000
+    ; Save the pristine BIOS INT 10h vector now (IVT[0x10] at physical 0x40), so a
+    ; runtime VBE mode switch can far-call the video BIOS directly even if the PXE
+    ; stack later repoints INT 10h in the IVT.
+    mov eax, [0x0040]              ; offset (low word) : segment (high word)
+    mov [saved_int10], eax
     call uart_init16
 
     in  al, 0x92                   ; enable A20 via the fast gate
@@ -63,7 +72,11 @@ stage2:
     mov ax, 0x1112                 ; load 8x8 font -> 80x50: chars shrink = zoom out
     xor bl, bl
     int 0x10
-    call anim_condense             ; the rain condenses into the face
+    call anim_condense             ; the rain condenses into the face (text mode, unchanged)
+    call extract_font              ; grab the 8x8 ROM font for the graphics console
+    call vbe_setup                 ; now switch to a VBE graphics mode (boot-time switch works
+                                   ; on real HW); the console renders the 0xB8000 text buffer
+                                   ; as pixels from here on, and images blit straight to the FB
 %endif
 
     lgdt [gdt_desc]
@@ -338,12 +351,16 @@ anim_condense:
 .ffd:
     ret
 
-; ================= VBE (linear framebuffer) mode set, real mode =================
-; vbe_setup: query the VBE controller, find a 32-bpp linear-framebuffer mode
-; (preferring 1024x768, else any 32-bpp LFB mode) and set it. On success stores
-; the framebuffer physical base / pitch / bpp / width / height for the PM code and
-; sets vbe_ok=1. DS=ES=0 on entry (flat low data reachable by label offset).
-vbe_setup:
+; ================= VBE (linear framebuffer), real mode =================
+; vbe_probe: query the VBE controller and find a 32-bpp linear-framebuffer mode
+; (preferring 1024x768, else any 32-bpp LFB mode) WITHOUT switching to it. Stores
+; the framebuffer physical base / pitch / bpp / width / height + mode number and
+; sets vbe_ok=1 on success. Called at boot so the text kernel can switch to this
+; mode later at runtime (gfx_enter). DS=ES=0 on entry.
+vbe_probe:
+    xor ax, ax                     ; the opening animation leaves ES=VGA seg; VBE calls
+    mov ds, ax                     ; use ES:DI and we read the blocks via DS, so force both
+    mov es, ax                     ; segments to 0 (flat low data by label offset)
     mov byte [vbe_ok], 0
     ; AX=4F00: VBE controller info -> vbe_info (ES:DI). Pre-seed the signature
     ; "VBE2" so a VBE 2.0+ BIOS returns the full 512-byte extended info block.
@@ -363,21 +380,31 @@ vbe_setup:
     mov word [want_h], 768
     call vbe_scan
     cmp word [found_mode], 0xFFFF
-    jne .haveit
+    jne .ok
     ; pass 2: any 32-bpp LFB mode (want_w=0 = accept any resolution)
     mov word [want_w], 0
     call vbe_scan
     cmp word [found_mode], 0xFFFF
     je  .fail
-.haveit:
+.ok:
+    mov byte [vbe_ok], 1
+.fail:
+    ret
+
+; vbe_setup: probe AND switch to the mode now (IMAGE_DEMO boot path). Leaves
+; vbe_ok=1 only if the mode was actually set.
+vbe_setup:
+    call vbe_probe
+    cmp byte [vbe_ok], 0
+    je  .done
     mov bx, [found_mode]
     or  bx, 0x4000                 ; bit14 = use linear framebuffer
     mov ax, 0x4F02
     int 0x10
     cmp ax, 0x004F
-    jne .fail
-    mov byte [vbe_ok], 1
-.fail:
+    je  .done
+    mov byte [vbe_ok], 0           ; mode set failed
+.done:
     ret
 
 ; vbe_scan: walk the mode list at [vmode_seg]:[vmode_off]. Accept a mode that is
@@ -446,6 +473,33 @@ vbe_scan:
 .done:
     ret
 
+; extract_font: copy the BIOS 8x8 ROM font (256 glyphs x 8 bytes) into font_buf so
+; the protected-mode graphics console can render the text buffer as pixels. Real mode.
+extract_font:
+    push es
+    push ds
+    push si
+    push di
+    push cx
+    mov ax, 0x1130
+    mov bh, 0x03                   ; ROM 8x8 double-dot font
+    int 0x10                       ; -> ES:BP = font pointer
+    mov ax, es
+    mov ds, ax                     ; DS:SI = font source
+    mov si, bp
+    xor ax, ax
+    mov es, ax                     ; ES:DI = 0:font_buf
+    mov di, font_buf
+    mov cx, 2048                   ; 256 * 8
+    cld
+    rep movsb
+    pop cx
+    pop di
+    pop si
+    pop ds
+    pop es
+    ret
+
 ; ================= 32-bit protected mode =================
 BITS 32
 pm_entry:
@@ -494,7 +548,26 @@ pm_entry:
     mov ax, 0x0030
     call pxe_call
 .no_pxe:
-    call show_face                 ; ensure the face is shown (condense already did)
+    cmp byte [vbe_ok], 0           ; set up the graphics text console geometry
+    je  .no_fb
+    mov eax, [lfb_pitch]
+    mul dword [lfb_h]
+    mov [fb_size], eax             ; framebuffer byte size (for image blits)
+    mov eax, [lfb_w]               ; centre the 640 x (SCR_ROWS*8) text block
+    sub eax, 640
+    sar eax, 1
+    mov [X0], eax
+    mov eax, [lfb_h]
+    sub eax, SCR_ROWS * 8
+    sar eax, 1
+    mov [Y0], eax
+.no_fb:
+    call vga_clear                 ; the RAM shadow is garbage at boot - blank it first
+    call show_face                 ; draw the Dario face into the text buffer
+    cmp byte [vbe_ok], 0
+    je  main_loop                  ; no VBE: stay in the text-mode fallback
+    call clear_lfb                 ; graphics console: paint the face onto the framebuffer
+    call present_text
 
 main_loop:
     cmp byte [pxe_present], 0
@@ -556,6 +629,7 @@ net_loop:
     call pit_init                  ; PXE may have reprogrammed the PIT
     call kbd_init                  ; real HW: enable 8042 translation + scanning
     call draw_prompt               ; "> " on the input line
+    mov byte [need_present], 1     ; repaint so the prompt shows in the graphics console
     ; --- one-time network self-test (needs no keyboard) ---
     ; auto-send "hello" to the dev PC so the UDP round-trip (send path + answer
     ; display) can be verified independently of the flaky physical keyboard.
@@ -569,6 +643,11 @@ net_loop:
     ; drain the PS/2 keyboard fully this iteration (no overflow/beep on fast
     ; typing); each mapped key echoes, Enter sends the line over UDP
     call kbd_service
+    cmp byte [need_present], 0      ; repaint the graphics console only when the text
+    je  .nopres                    ; buffer actually changed (keystroke / reply / command)
+    mov byte [need_present], 0
+    call refresh_console
+.nopres:
     ; Always tight-poll UDP_READ (no delay). On real hardware a polling gap drops
     ; incoming packets, so the Agent's bursts need continuous reading.
     ; UDP_READ
@@ -597,6 +676,14 @@ net_loop:
     mov ecx, 760
 .lenok:
     mov byte [rx_buf+ecx], 0       ; null-terminate the raw packet
+    cmp byte [rx_buf], 'G'         ; G = blit raw pixels into the VBE framebuffer
+    je  .do_gblit
+    cmp byte [rx_buf], 'V'         ; V = switch display into graphics mode (show image)
+    je  .do_gfxon
+    cmp byte [rx_buf], 'U'         ; U = back to text mode + redraw the face
+    je  .do_gfxoff
+    cmp byte [rx_buf], 'Q'         ; Q = reply framebuffer geometry
+    je  .do_qgeo
     cmp byte [rx_buf], 'B'         ; block write (multi-line) parsed from rx_buf
     je  .do_block
     ; copy rx_buf -> line_buf up to CR/LF/limit (single-line commands)
@@ -638,6 +725,8 @@ net_loop:
 .do_clear:
     mov byte [rain_on], 0          ; display mode: stop ambient rain for a clean face
     call vga_clear
+    mov byte [gfx_mode], 0         ; leaving any image -> clear the framebuffer on repaint
+    mov byte [need_present], 1
     jmp .poll
 .do_rain:
     mov byte [rain_on], 1          ; resume ambient rain
@@ -649,6 +738,7 @@ net_loop:
     call vga_putc
     mov al, 10
     call vga_putc
+    mov byte [need_present], 1
     jmp .poll
 .do_pos:
     ; S<2hex row><2hex col><text> : write text at (row,col). Idempotent.
@@ -666,6 +756,7 @@ net_loop:
     mov [vga_pos], ecx             ; cursor = row*80 + col
     mov esi, [parse_ptr]           ; text after the hex fields
     call vga_puts
+    mov byte [need_present], 1
     jmp .poll
 .do_block:
     ; B<2hex startrow> then newline-separated lines -> write each at (row+i, 0).
@@ -686,14 +777,14 @@ net_loop:
     jmp .blk_line
 .blk_go:
     test al, al
-    jz  .poll                      ; end of packet
+    jz  .blk_done                  ; end of packet
     mov eax, [blk_row]
     imul eax, eax, 80
     mov [vga_pos], eax             ; cursor = row*80 (col 0)
 .blk_wr:
     mov al, [esi]
     test al, al
-    jz  .poll
+    jz  .blk_done
     cmp al, 10
     je  .blk_eol
     call vga_putc
@@ -703,6 +794,51 @@ net_loop:
     inc esi
     inc dword [blk_row]
     jmp .blk_line
+.blk_done:
+    mov byte [need_present], 1     ; repaint the console with the new block of text
+    jmp .poll
+.do_gfxon:                         ; V: (graphics console is always on) - just ack
+    mov byte [tx_buf], 1
+    mov word [tx_len], 1
+    jmp .reply
+.do_gfxoff:                        ; U: drop any full-screen image, repaint the text/face
+    mov byte [gfx_mode], 0
+    call restore_text
+    jmp .poll
+.do_gblit:                         ; G<8hex LFB offset><raw pixels>: blit to framebuffer
+    cmp ecx, 9
+    jbe .poll
+    mov byte [gfx_mode], 1         ; a full-screen image is now shown (text hidden)
+    sub ecx, 9
+    mov [pix_len], ecx
+    mov dword [parse_ptr], rx_buf + 1
+    mov bl, 8
+    call phex                      ; EAX = LFB byte offset
+    cmp eax, [fb_size]
+    jae .poll
+    mov edx, [fb_size]
+    sub edx, eax
+    mov ecx, [pix_len]
+    cmp ecx, edx
+    jbe .okg
+    mov ecx, edx
+.okg:
+    mov edi, [lfb_phys]
+    add edi, eax
+    lea esi, [rx_buf+9]
+    rep movsb
+    jmp .poll
+.do_qgeo:                          ; Q: reply 4 LE dwords w,h,pitch,bpp
+    mov eax, [lfb_w]
+    mov [tx_buf+0], eax
+    mov eax, [lfb_h]
+    mov [tx_buf+4], eax
+    mov eax, [lfb_pitch]
+    mov [tx_buf+8], eax
+    mov eax, [lfb_bpp]
+    mov [tx_buf+12], eax
+    mov word [tx_len], 16
+    jmp .reply
 .reply:
     ; UDP_WRITE the reply back to the sender
     mov edi, pxe_param
@@ -1122,7 +1258,7 @@ show_face:
 ; draw_prompt: draw "> " at the start of the input line.
 draw_prompt:
     mov dword [kbd_len], 0
-    mov edi, INPUT_ROW * 80 * 2 + 0xB8000
+    mov edi, INPUT_ROW * 80 * 2 + VGA
     mov word [edi], 0x0A3E         ; '>'
     mov word [edi+2], 0x0A20       ; ' '
     ; enable & shape the hardware text cursor (underline, visible)
@@ -1276,14 +1412,14 @@ kbd_service:
     mov ecx, 24                    ; bound the drain per iteration
 .ks:
     in  al, 0x64
-    mov edi, 0xB8000 + HUD_CELL     ; HUD: controller status at col 0
+    mov edi, VGA + HUD_CELL         ; HUD: controller status at col 0
     call hud_byte
     test al, 1                     ; output buffer empty?
     jz  .ksret
     test al, 0x20                  ; aux (mouse) byte?
     jnz .ksaux
     in  al, 0x60                   ; scancode
-    mov edi, 0xB8000 + HUD_CELL + 6 ; HUD: scancode at col 3
+    mov edi, VGA + HUD_CELL + 6     ; HUD: scancode at col 3
     call hud_byte
     cmp al, 0xE0                   ; extended-key prefix (arrows etc.)?
     je  .ksext
@@ -1340,6 +1476,7 @@ kbd_service:
 ; kbd_char: handle a typed character in AL (echo on the input line; Enter sends).
 kbd_char:
     pushad
+    mov byte [need_present], 1      ; a keystroke changed the input line -> repaint console
     cmp al, 13
     je  .enter
     cmp al, 8
@@ -1352,7 +1489,7 @@ kbd_char:
     mov edi, INPUT_ROW * 80 + 2
     add edi, ebx
     shl edi, 1
-    add edi, 0xB8000
+    add edi, VGA
     mov [edi], al                  ; echo
     mov byte [edi+1], 0x0F
     jmp .done
@@ -1364,7 +1501,7 @@ kbd_char:
     mov edi, INPUT_ROW * 80 + 2
     add edi, ebx
     shl edi, 1
-    add edi, 0xB8000
+    add edi, VGA
     mov word [edi], 0x0A20         ; erase
     jmp .done
 .enter:
@@ -1372,7 +1509,7 @@ kbd_char:
     je  .done
     call send_question             ; UDP the line to the dev-PC agent service
     ; clear the input line
-    mov edi, (INPUT_ROW * 80 + 2) * 2 + 0xB8000
+    mov edi, (INPUT_ROW * 80 + 2) * 2 + VGA
     mov ecx, 72
     mov ax, 0x0A20
 .cl:
@@ -1406,13 +1543,13 @@ send_question:
     mov ax, 0x0033                      ; PXENV_UDP_WRITE
     call pxe_call
     ; HUD: 'W=' + UDP_WRITE status word (0000 = success) at bottom row, col 9
-    mov word [0xB8000 + HUD_CELL + 18], 0x0E57   ; 'W'
-    mov word [0xB8000 + HUD_CELL + 20], 0x0E3D   ; '='
+    mov word [VGA + HUD_CELL + 18], 0x0E57   ; 'W'
+    mov word [VGA + HUD_CELL + 20], 0x0E3D   ; '='
     mov al, [pxe_param+1]               ; status high byte
-    mov edi, 0xB8000 + HUD_CELL + 22
+    mov edi, VGA + HUD_CELL + 22
     call hud_byte
     mov al, [pxe_param+0]               ; status low byte
-    mov edi, 0xB8000 + HUD_CELL + 26
+    mov edi, VGA + HUD_CELL + 26
     call hud_byte
     ret
 
@@ -2033,6 +2170,129 @@ pc_prot32:
     popad
     ret
 
+; ================= graphics console: render the text buffer as pixels ===========
+; The display stays in one VBE graphics mode (set once at boot). The existing text
+; code still writes char+attr cells to the 0xB8000 buffer; present_text paints that
+; buffer into the linear framebuffer with the 8x8 ROM font. Images blit straight to
+; the framebuffer, and restore_text repaints the text over them. No runtime mode
+; switching (which this old GMA won't do), so it is reliable on real hardware.
+
+; clear_lfb: fill the whole framebuffer black.
+clear_lfb:
+    cmp byte [vbe_ok], 0
+    je  .q
+    pushad
+    mov edi, [lfb_phys]
+    mov ecx, [fb_size]
+    shr ecx, 2
+    xor eax, eax
+    rep stosd
+    popad
+.q:
+    ret
+
+; present_text: paint the 80 x SCR_ROWS text buffer at VGA (0xB8000) into the LFB.
+present_text:
+    cmp byte [vbe_ok], 0
+    je  .q
+    pushad
+    xor ebx, ebx                   ; row
+.prow:
+    xor ecx, ecx                   ; col
+.pcol:
+    mov eax, ebx
+    imul eax, 80
+    add eax, ecx
+    shl eax, 1
+    movzx edx, byte [VGA + eax]    ; char
+    movzx esi, byte [VGA + eax + 1]; attr
+    call draw_glyph
+    inc ecx
+    cmp ecx, 80
+    jb  .pcol
+    inc ebx
+    cmp ebx, SCR_ROWS
+    jb  .prow
+    popad
+.q:
+    ret
+
+; draw_glyph: render one 8x8 glyph. ecx=col, ebx=row, dl=char, esi=attr. Colour from
+; the attribute low nibble (white / bright green / dim green). Preserves all regs.
+draw_glyph:
+    pushad
+    and esi, 0x0F
+    mov eax, 0x0000FF00            ; bright green (BGRX: G=0xFF)
+    cmp esi, 0x0F
+    jne .c1
+    mov eax, 0x00FFFFFF            ; white
+.c1:
+    cmp esi, 0x02
+    jne .c2
+    mov eax, 0x00008000           ; dim green
+.c2:
+    mov [g_fg], eax
+    mov eax, ecx                  ; px0 = X0 + col*8
+    shl eax, 3
+    add eax, [X0]
+    mov [g_px0], eax
+    mov eax, ebx                  ; py0 = Y0 + row*8
+    shl eax, 3
+    add eax, [Y0]
+    mov [g_py0], eax
+    movzx eax, dl                 ; font row base = font_buf + char*8
+    shl eax, 3
+    add eax, font_buf
+    mov [g_fontp], eax
+    xor eax, eax
+    mov [g_gy], eax
+.gy:
+    mov esi, [g_fontp]
+    mov eax, [g_gy]
+    movzx edx, byte [esi+eax]     ; 8 glyph bits for this row
+    mov eax, [g_py0]
+    add eax, [g_gy]
+    imul eax, [lfb_pitch]
+    add eax, [lfb_phys]
+    mov ecx, [g_px0]
+    lea edi, [eax + ecx*4]        ; dest pixel address
+    mov cl, 0x80                  ; bit mask (MSB first)
+.gx:
+    test dl, cl
+    jz  .blk
+    mov eax, [g_fg]
+    jmp .put
+.blk:
+    xor eax, eax
+.put:
+    mov [edi], eax
+    add edi, 4
+    shr cl, 1
+    jnz .gx
+    inc dword [g_gy]
+    cmp dword [g_gy], 8
+    jb  .gy
+    popad
+    ret
+
+; restore_text: blank the framebuffer and repaint the text buffer (return from a
+; full-screen image back to the face / chat).
+restore_text:
+    call clear_lfb
+    call present_text
+    ret
+
+; refresh_console: repaint after a text change. If an image was up, clear first.
+refresh_console:
+    cmp byte [gfx_mode], 0
+    je  .plain
+    mov byte [gfx_mode], 0
+    call restore_text
+    ret
+.plain:
+    call present_text
+    ret
+
 %ifdef IMAGE_DEMO
 ; ================= image demo: draw into the linear framebuffer (32-bit PM) =====
 ; Flat 4 GiB segments make the (high) LFB physical address directly writable.
@@ -2300,6 +2560,19 @@ lfb_w       dd 0                   ; width in pixels
 lfb_h       dd 0                   ; height in pixels
 fb_size     dd 0                   ; framebuffer byte size = pitch * height
 pix_len     dd 0                   ; pixel byte count of the current G packet
+gfx_mode    db 0                   ; 1 = a full-screen image is shown (text hidden)
+need_present db 0                  ; 1 = text buffer changed, repaint the console next poll
+align 4
+saved_int10 dd 0                   ; BIOS INT 10h vector saved at boot (offset:segment)
+; ---- graphics text console state ----
+X0          dd 0                   ; pixel origin of the 80xSCR_ROWS text block (centred)
+Y0          dd 0
+g_fg        dd 0                   ; draw_glyph scratch
+g_px0       dd 0
+g_py0       dd 0
+g_fontp     dd 0
+g_gy        dd 0
+font_buf    times 2048 db 0        ; 8x8 ROM font (256 glyphs x 8 bytes)
 vmode_off   dw 0                   ; VideoModePtr offset
 vmode_seg   dw 0                   ; VideoModePtr segment
 want_w      dw 0                   ; mode-scan target width (0 = any)

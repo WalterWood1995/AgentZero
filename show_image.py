@@ -1,35 +1,46 @@
 #!/usr/bin/env python3
 # show_image.py - stream a photo to the AgentZero bare-metal kernel's VBE linear
-# framebuffer over UDP, so an OS-less laptop displays a full-screen high-res image.
+# framebuffer over UDP, so an OS-less laptop displays a full-screen image.
 #
 # The dev PC does all the heavy lifting (decode / scale / BGRX conversion); the
-# kernel just copies raw pixel bytes into the framebuffer. Protocol (UDP :50000):
-#   Q                               -> kernel replies 16 bytes: <w h pitch bpp> (LE)
-#   G<8 hex LFB byte offset><bytes>  -> kernel writes those bytes at that FB offset
+# kernel just copies raw pixel bytes into the framebuffer. UDP protocol (:50000):
+#   Q                               -> reply 16 bytes: <w h pitch bpp> (LE)
+#   V                               -> switch the live display into graphics mode
+#                                      (reply 1 byte: 1 = ready, 0 = no VBE)
+#   G<8 hex LFB byte offset><bytes> -> write those bytes at that framebuffer offset
+#   U                               -> back to text mode + redraw the face
 #
-# Build/run the kernel with IMAGE_DEMO=1 (graphics kernel) and PXE-boot the laptop.
+# In the default face/chat kernel these switch the screen live (face <-> image).
+# Used standalone or imported by agent_chat.py (for `web <domain>` screenshots).
 #
 # Usage:
 #   python show_image.py <image> [old-pc-ip] [--fit|--cover|--stretch]
-#                                 [--passes N] [--chunk PIXELS] [--delay SEC]
+#          [--enter] [--exit] [--passes N] [--chunk PIXELS] [--delay SEC]
 import socket, struct, sys, time
 
 try:
     from PIL import Image
     import numpy as np
-except ImportError:
-    sys.exit("needs Pillow + numpy:  pip install pillow numpy")
+except ImportError as _e:                           # let importers degrade gracefully
+    if __name__ == "__main__":
+        sys.exit("needs Pillow + numpy:  pip install pillow numpy")
+    raise
 
 PORT       = 50000
 DEF_IP     = "192.168.178.114"      # old Asus (see memory)
 DEF_W, DEF_H, DEF_PITCH, DEF_BPP = 1024, 768, 1024 * 4, 32
 
 
+def _sock():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(1.5)
+    return s
+
+
 def query_geometry(sock, ip):
     """Ask the kernel for its real framebuffer geometry; fall back to defaults."""
     try:
         sock.sendto(b"Q", (ip, PORT))
-        sock.settimeout(1.5)
         for _ in range(3):
             try:
                 data, _ = sock.recvfrom(64)
@@ -41,13 +52,40 @@ def query_geometry(sock, ip):
                     return w, h, pitch, bpp
     except (ConnectionResetError, OSError, socket.timeout):
         pass
-    print("  (no geometry reply; assuming %dx%d pitch=%d bpp=%d)"
-          % (DEF_W, DEF_H, DEF_PITCH, DEF_BPP))
     return DEF_W, DEF_H, DEF_PITCH, DEF_BPP
 
 
-def fit_image(path, w, h, mode):
-    img = Image.open(path).convert("RGB")
+def enter_graphics(sock, ip, tries=8):
+    """Switch to graphics mode. V is a single packet and the real-HW channel drops
+    packets, so send it several times (gfx_enter is idempotent); if even one V is
+    lost the kernel would ignore every following G. Collect the ack byte if any."""
+    acked = None
+    for _ in range(tries):
+        try:
+            sock.sendto(b"V", (ip, PORT))
+            data, _ = sock.recvfrom(16)
+            if data:
+                acked = data[0]
+        except (ConnectionResetError, OSError, socket.timeout):
+            pass
+        time.sleep(0.08)
+    return acked                # 1 = graphics engaged, 0 = no VBE, None = no ack (assume ok)
+
+
+def exit_graphics(sock, ip):
+    """Send U (back to text mode + face). Fire-and-forget, with redundancy."""
+    for _ in range(3):
+        try:
+            sock.sendto(b"U", (ip, PORT))
+        except OSError:
+            pass
+        time.sleep(0.05)
+
+
+def fit_image(src, w, h, mode="cover"):
+    """src is a path or a PIL Image. Returns an (h, w, 4) BGRX uint8 array."""
+    img = src if isinstance(src, Image.Image) else Image.open(src)
+    img = img.convert("RGB")
     if mode == "stretch":
         img = img.resize((w, h), Image.LANCZOS)
     elif mode == "fit":                              # letterbox: whole image, black bars
@@ -69,22 +107,71 @@ def fit_image(path, w, h, mode):
     bgrx[..., 0] = rgb[..., 2]                        # B
     bgrx[..., 1] = rgb[..., 1]                        # G
     bgrx[..., 2] = rgb[..., 0]                        # R
-    return bgrx                                       # (h, w, 4)  X = 0
+    return bgrx                                       # X = 0
+
+
+def stream_bgrx(sock, ip, bgrx, pitch, passes=2, chunkpix=180, delay=0.0006):
+    """Send a BGRX frame to the framebuffer, scanline by scanline (never spanning
+    the pitch gap). Several idempotent passes ride out dropped packets."""
+    h, w = bgrx.shape[0], bgrx.shape[1]
+    maxpix = min(chunkpix, 187)                       # keep each packet <= 760 bytes
+    npkt = 0
+    for _ in range(passes):
+        for y in range(h):
+            row = bgrx[y].tobytes()
+            base = y * pitch
+            x = 0
+            while x < w:
+                n = min(maxpix, w - x)
+                pkt = b"G" + ("%08X" % (base + x * 4)).encode() + row[x * 4: x * 4 + n * 4]
+                try:
+                    sock.sendto(pkt, (ip, PORT))
+                except (ConnectionResetError, OSError):
+                    pass
+                npkt += 1
+                if delay:
+                    time.sleep(delay)
+                x += n
+    return npkt
+
+
+def show(src, ip=DEF_IP, mode="cover", enter=False, exit_after=False,
+         passes=2, chunkpix=180, delay=0.0006, sock=None):
+    """High-level: query geometry, scale, optionally enter graphics, stream."""
+    own = sock is None
+    sock = sock or _sock()
+    try:
+        w, h, pitch, bpp = query_geometry(sock, ip)
+        if enter:
+            enter_graphics(sock, ip)
+            time.sleep(0.2)
+        bgrx = fit_image(src, w, h, mode)
+        n = stream_bgrx(sock, ip, bgrx, pitch, passes, chunkpix, delay)
+        if exit_after:
+            exit_graphics(sock, ip)
+        return w, h, pitch, bpp, n
+    finally:
+        if own:
+            sock.close()
 
 
 def main():
     if len(sys.argv) < 2:
         sys.exit(__doc__)
     path = sys.argv[1]
-    ip = DEF_IP
-    mode = "cover"
+    ip, mode = DEF_IP, "cover"
     passes, chunkpix, delay = 2, 180, 0.0006
+    enter = exit_after = False
     args = sys.argv[2:]
     i = 0
     while i < len(args):
         a = args[i]
         if a in ("--fit", "--cover", "--stretch"):
             mode = a[2:]
+        elif a == "--enter":
+            enter = True
+        elif a == "--exit":
+            exit_after = True
         elif a == "--passes":
             i += 1; passes = int(args[i])
         elif a == "--chunk":
@@ -94,40 +181,12 @@ def main():
         elif not a.startswith("--"):
             ip = a
         i += 1
-
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    w, h, pitch, bpp = query_geometry(sock, ip)
-    print("framebuffer %dx%d pitch=%d bpp=%d  ->  %s:%d" % (w, h, pitch, bpp, ip, PORT))
-    if bpp != 32:
-        print("  WARNING: kernel reports %d bpp; show_image only emits 32-bpp BGRX" % bpp)
-
-    bgrx = fit_image(path, w, h, mode)               # (h, w, 4)
-    rowbytes = w * 4
-    maxpix = min(chunkpix, 187)                       # keep packet <= 760 (9 hdr + 748)
-
-    npkt = 0
     t0 = time.time()
-    for _ in range(passes):
-        for y in range(h):
-            row = bgrx[y].tobytes()                   # rowbytes long, this scanline only
-            base = y * pitch                          # never span the pitch gap
-            x = 0
-            while x < w:
-                n = min(maxpix, w - x)
-                off = base + x * 4
-                payload = row[x * 4: x * 4 + n * 4]
-                pkt = b"G" + ("%08X" % off).encode() + payload
-                try:
-                    sock.sendto(pkt, (ip, PORT))
-                except (ConnectionResetError, OSError):
-                    pass
-                npkt += 1
-                if delay:
-                    time.sleep(delay)
-                x += n
+    w, h, pitch, bpp, n = show(path, ip, mode, enter, exit_after, passes, chunkpix, delay)
     dt = time.time() - t0
+    print("framebuffer %dx%d pitch=%d bpp=%d -> %s:%d" % (w, h, pitch, bpp, ip, PORT))
     print("sent %d packets in %d pass(es), %.1fs (%.0f pkt/s)"
-          % (npkt, passes, dt, npkt / dt if dt else 0))
+          % (n, passes, dt, n / dt if dt else 0))
 
 
 if __name__ == "__main__":

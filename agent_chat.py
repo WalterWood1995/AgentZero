@@ -17,6 +17,13 @@ import textwrap
 import threading
 import time
 
+try:
+    import show_image                              # stream a photo to the VBE framebuffer
+    import webshot                                 # screenshot a web page with headless Chrome
+except Exception as _e:                            # keep chat working even if these fail to import
+    show_image = webshot = None
+    print("image display unavailable (%r)" % _e, flush=True)
+
 Q_PORT = 50001          # we listen here (questions from the old PC)
 R_PORT = 50000          # kernel listens here (display commands)
 LEFT_W = 38             # left dialogue column width (face is on the right)
@@ -156,6 +163,46 @@ def answer(q):
     return llm_answer(q) or _canned(q)
 
 
+# ---- image display: show web-page screenshots / photos on the old PC's screen ----
+# A separate UDP socket for V/U/display sends (the kernel's acks come back here, not
+# to the question listener). _showing tracks whether the screen is on an image.
+_disp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+_disp.settimeout(1.5)
+_showing = {"on": False}
+IMG_VERBS = ("web ", "pic ", "img ", "show ", "bild ", "seite ")   # all lowercase, no Shift
+
+
+def _send_text(sock, peer, a, q=None):
+    """Paint a Q/A reply onto the old PC's left column (one padded block write)."""
+    lines = []
+    if q is not None:
+        lines.append("Q: " + q)
+    for ln in textwrap.wrap("A: " + a, LEFT_W) or ["A:"]:
+        lines.append(ln)
+    lines = lines[:PANE_H]
+    while len(lines) < PANE_H:
+        lines.append("")
+    payload = "B00\n" + "\n".join(l.ljust(40)[:40] for l in lines)
+    for _ in range(4):
+        sock.sendto(payload.encode("latin1"), (peer, R_PORT))
+
+
+def show_page(peer, target):
+    """Screenshot `target` and stream it full-screen to the old PC (graphics mode)."""
+    png = webshot.screenshot(target)
+    show_image.show(png, peer, mode="cover", enter=not _showing["on"],
+                    passes=3, delay=0.0008)
+    _showing["on"] = True
+
+
+def back_to_face(peer):
+    """Leave graphics mode and redraw the face (if an image is currently shown)."""
+    if _showing["on"] and show_image is not None:
+        show_image.exit_graphics(_disp, peer)
+        _showing["on"] = False
+        time.sleep(0.4)                              # let the mode switch + face redraw settle
+
+
 # ---- the talking face: speak each answer on the dev PC (Windows SAPI), and
 # flap the portrait's mouth on the old PC's screen while it speaks ----
 # One worker thread plays queued answers in order so they never overlap; text is
@@ -242,8 +289,32 @@ def main():
         try:
             q = data.decode("latin1", "replace")
             print("Q from %s:%d  (%d bytes): %r" % (addr[0], addr[1], len(data), q), flush=True)
-            _last_peer[0] = addr[0]              # the old PC, for the talking-face mouth
-            key = (addr[0], q)
+            peer = addr[0]
+            _last_peer[0] = peer                 # the old PC, for the talking-face mouth
+            low = q.strip().lower()
+
+            # --- image command: "web <domain>" etc. -> screenshot the page, show it ---
+            verb = next((v for v in IMG_VERBS if low.startswith(v)), None)
+            if verb and show_image is not None and webshot is not None:
+                target = q.split(None, 1)[1].strip() if len(q.split(None, 1)) > 1 else ""
+                if target:
+                    try:
+                        show_page(peer, target)
+                        print("showing %r on %s" % (target, peer), flush=True)
+                    except Exception as e:
+                        print("webshot error: %r" % e, flush=True)
+                        back_to_face(peer)
+                        _send_text(s, peer, "could not load " + target)
+                    continue
+
+            # --- any other input while an image is up: return to the face first ---
+            if _showing["on"]:
+                back_to_face(peer)
+                if low in ("", "back", "face", "home", "weiter", "zurueck", "zuruck", "ok"):
+                    continue                     # just go back to the face, no answer text
+
+            # --- normal Q&A ---
+            key = (peer, q)
             now = time.time()
             if key == last["key"] and now - last["t"] < 4.0:
                 a = last["a"]                    # duplicate within 4s: reuse, don't re-ask the LLM
@@ -251,19 +322,8 @@ def main():
                 a = answer(q)
                 last.update(key=key, a=a, t=now)
                 speak(a)                         # the talking face reads new answers aloud
-            # build left-column lines: question then wrapped answer, padded to a
-            # fixed height so a shorter reply fully overwrites the previous one
-            lines = ["Q: " + q]
-            for ln in textwrap.wrap("A: " + a, LEFT_W) or ["A:"]:
-                lines.append(ln)
-            lines = lines[:PANE_H]
-            while len(lines) < PANE_H:
-                lines.append("")
-            # one block write, each line padded to clear the left column (not the face)
-            payload = "B00\n" + "\n".join(l.ljust(40)[:40] for l in lines)
-            for _ in range(4):                   # fire-and-forget with redundancy
-                s.sendto(payload.encode("latin1"), (addr[0], R_PORT))
-            print("A -> %s:%d  (%d lines): %r" % (addr[0], R_PORT, len(lines), a), flush=True)
+            _send_text(s, peer, a, q)
+            print("A -> %s:%d : %r" % (peer, R_PORT, a), flush=True)
         except Exception as e:                   # never let one bad packet kill the loop
             print("handler error (ignored): %r" % e, flush=True)
 
