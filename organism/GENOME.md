@@ -15,7 +15,8 @@ is made of four parts:
 
 - **Senses + hands** — `hw.py`, and only `hw.py`. It wraps the kernel's ring-0
   instruction set over UDP: CPUID, PCI config read, physical-memory read, I/O-port
-  read, RTC, (gated) I/O-port write, framebuffer write. This minimal, universal
+  read, RTC, (gated) I/O-port write, (gated) physical-memory / MMIO dword write,
+  framebuffer write. This minimal, universal
   "read/write hardware" interface is the Agent's entire contact with the metal.
   There is no generic OS abstraction in between — that is the source of the
   efficiency: the Agent programs exactly what the task needs.
@@ -26,7 +27,10 @@ is made of four parts:
   - `knowledge/<slug>.md` — a model of the target: identity, registers/capabilities,
     how it works, how to drive it, open questions.
   - `skills/<slug>.py` — a concrete, replayable operation on the target (built on
-    `hw.py`), with a safety gate. A skill is understanding made executable.
+    `hw.py`), with a safety gate. A skill is understanding made executable. A skill
+    is either **read-only** (probes, never changes state) or a **gated write skill**
+    (see section 4.1): it changes hardware state, so it must declare exactly which
+    writes it makes and why they are safe, and it refuses to run until armed.
 - **Replication rule** — if the target is too complex to understand as one unit (a
   CPU, a GPU), the Agent **decomposes** it into subsystems and **spawns one child
   Agent per subsystem**, each inheriting context and a narrowed target. Children
@@ -61,6 +65,45 @@ is made of four parts:
   before they are armed. No Agent writes to hardware it does not yet understand.
 - The SATA/AHCI storage controller is **off-limits** (it is what hangs this machine's
   Linux). Agents enumerate it in PCI space but never initialize or write it.
+
+### 4.1 Gated write skills — how the organism *operates* hardware
+
+Understanding is read-only; operation is writing. The step from one to the other is
+deliberate and reviewed, never incidental. A write skill is born in four stages:
+
+1. **Propose.** The Agent writes `skills/<slug>.py` that states, up front and in
+   words, the *exact* writes it will make (each address/port and value), *why each
+   one is safe* (what the register does, why this value cannot brick or hang the
+   device, and how it is reversed), and what it will read back to *prove* the write
+   landed. It targets only hardware the organism already understands (there is a
+   `knowledge/` note for it). It never touches the SATA/AHCI controller.
+2. **Review.** A human (or a coordinator Agent) reads the proposal and checks the
+   writes against the knowledge note. This is the moment the SATA rule and the
+   "only what you understand" rule are enforced.
+3. **Arm.** The skill will not write until it is explicitly armed — it requires
+   `--arm` on the command line (or `ARM=1` in the environment). Unarmed, it prints
+   the plan and the gate self-test only (it shows that an *unconfirmed* write is
+   refused by the kernel) and exits without changing anything. This makes a dry run
+   the default and an accidental write impossible.
+4. **Execute.** Armed, the skill issues each write through the kernel's confirm-byte
+   gate (`hw.outb(...)` / `hw.write32(...)`, which send the trailing `!`), then reads
+   back to verify, and — where the operation is meant to be transient — restores the
+   previous state so the machine is left as it was found.
+
+Two write primitives reach the metal, both gated in the kernel (the kernel refuses a
+write whose command lacks the `!` confirm byte, so nothing writes by accident):
+
+- **`hw.outb(port, val)`** — one byte to an I/O port (kernel `O<port><val>!`).
+- **`hw.write32(addr, dword)`** — one dword to a linear/physical address, which
+  reaches both plain RAM and memory-mapped device registers such as a NIC's BAR0
+  MMIO block (kernel `W<addr><dword>!`).
+
+Device programming (descriptor rings, control registers) is built from these. The
+rule of thumb for "safe": prefer registers that are plain read/write and observable
+(write a value, read it back); do not set enable/reset/bus-master bits on a device
+until a reviewed skill has established that doing so is safe; keep the first
+operations reversible; and verify the device is still healthy (e.g. NIC link still
+up) after writing.
 
 ## 5. The Device Agent brief (the template every Agent is born with)
 

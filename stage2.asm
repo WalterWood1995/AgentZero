@@ -17,6 +17,8 @@
 ;   P<2hex bus><2hex dev><1hex func><2hex off>
 ;                            -> PCI config dword via mechanism 1 (0xCF8/0xCFC)
 ;   O<4hex port><2hex val>!  -> outb (GATED: trailing '!' confirm byte required)
+;   W<8hex addr><8hex dword>! -> write one dword to linear/physical memory or MMIO
+;                              (GATED: trailing '!' confirm byte required)
 ;   ?                        -> list commands
 ;
 ; Build: nasm -f bin stage2.asm -o stage2.bin
@@ -610,6 +612,8 @@ exec_line:
     je  do_pci
     cmp al, 'O'
     je  do_out
+    cmp al, 'W'
+    je  do_write
     cmp al, '?'
     je  do_help
     mov esi, s_unknown
@@ -1019,6 +1023,34 @@ do_out:
     mov edx, [tmp_port]
     mov eax, [tmp_val]
     out dx, al                     ; the gated hardware write
+    mov esi, s_wok
+    call out_puts
+    jmp exec_done
+.abort:
+    mov esi, s_wabort
+    call out_puts
+    jmp exec_done
+
+; ---- W<8hex addr><8hex dword>!: GATED physical/MMIO dword write ----
+; Mirrors the O (outb) gate exactly: the trailing '!' confirm byte is mandatory,
+; or the write is refused. Writes one 32-bit dword to a flat linear (= physical)
+; address, so it reaches both plain RAM and memory-mapped device registers (e.g.
+; the e1000 MMIO block at BAR0). This is the organism's hand for device
+; programming; an Agent proposes the exact writes as a reviewed, armed skill.
+do_write:
+    mov bl, 8
+    call phex                      ; EAX = linear/physical address
+    mov [tmp_addr], eax
+    mov bl, 8
+    call phex                      ; EAX = dword value
+    mov [tmp_dw], eax
+    mov esi, [parse_ptr]
+    mov al, [esi]
+    cmp al, '!'                    ; mandatory confirm byte
+    jne .abort
+    mov edi, [tmp_addr]
+    mov eax, [tmp_dw]
+    mov [edi], eax                 ; the gated 32-bit write (flat 4 GiB segment)
     mov esi, s_wok
     call out_puts
     jmp exec_done
@@ -2546,7 +2578,8 @@ banner    db 13,10,"PM32 ok - AgentZero v1 ring0 32-bit [MATRIX]. '?' for comman
 prompt    db "agent> ",0
 s_unknown db " ?",13,10,0
 s_help    db "C=cpuid-vendor F=cpuid-leaf1 I<4hex>=inb T=rtc M<8hex><2hex>=mem "
-          db "P<bb><dd><f><oo>=pci O<pppp><vv>!=outb(gated) ?=help",13,10,0
+          db "P<bb><dd><f><oo>=pci O<pppp><vv>!=outb(gated) "
+          db "W<aaaaaaaa><dddddddd>!=mem/mmio-dword(gated) ?=help",13,10,0
 s_wok     db "write ok",13,10,0
 s_wabort  db "write aborted (need '!')",13,10,0
 s_pcihdr  db "== PCI scan  bus:dev.fn  vendor:device  class ==",13,10,0
@@ -2645,6 +2678,8 @@ pci_func  db 0
 vbuf      times 16 db 0
 tmp_port  dd 0
 tmp_val   dd 0
+tmp_addr  dd 0                     ; W command: target linear/physical address
+tmp_dw    dd 0                     ; W command: dword value to write
 parse_ptr dd 0
 vga_pos   dd 0
 rseed     dw 0xACE1                 ; real-mode animation PRNG seed

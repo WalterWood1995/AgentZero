@@ -11,7 +11,16 @@
 #   python hw.py [ip] cfg  <bus> <dev> <fn>              # full 256-byte config space
 #   python hw.py [ip] mem  <addr> <len>                  # read physical memory (hex)
 #   python hw.py [ip] in   <port>                        # inb from an I/O port
+#   python hw.py [ip] out   <port> <val>                 # GATED outb (confirm byte)
+#   python hw.py [ip] write <addr> <dword>               # GATED mem/MMIO dword write
 # IP defaults to 127.0.0.1 (a QEMU-hosted kernel); pass the Asus IP for real metal.
+#
+# WRITES ARE GATED. The kernel refuses a write whose command lacks the trailing
+# '!' confirm byte, so hw.py never writes by accident. An Agent must not call these
+# ad hoc: it proposes a write as a reviewed skill (the exact writes + why they are
+# safe), which is armed before it runs (see GENOME.md "gated write skills"). The
+# SATA/AHCI controller is off-limits for writes.
+import os
 import socket
 import sys
 import time
@@ -20,7 +29,11 @@ PORT = 50000
 
 
 class HW:
-    def __init__(self, ip="127.0.0.1", port=PORT, timeout=2.5):
+    def __init__(self, ip="127.0.0.1", port=None, timeout=2.5):
+        # AGENTZERO_PORT lets a second kernel instance (e.g. a test QEMU on a
+        # different host UDP forward) be reached without editing call sites.
+        if port is None:
+            port = int(os.environ.get("AGENTZERO_PORT", PORT))
         self.ip, self.port, self.timeout = ip, port, timeout
         self.s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
@@ -100,6 +113,40 @@ class HW:
         """Full config space as a list of dwords (nbytes/4 of them)."""
         return [self.pci(bus, dev, fn, off) for off in range(0, nbytes, 4)]
 
+    # ---- write primitives (GATED: the kernel needs the trailing '!' confirm
+    # byte, so a write only happens when we deliberately send it). These are the
+    # organism's only way to change hardware state; use them only from a reviewed,
+    # armed write-skill, never ad hoc. ----
+    def outb(self, port, val, confirm=True):
+        """GATED outb: O<4hex port><2hex val>!  -> 'write ok' or 'write aborted'.
+        confirm=False deliberately omits '!' so the kernel refuses (gate self-test)."""
+        cmd = "O%04X%02X" % (port & 0xFFFF, val & 0xFF)
+        if confirm:
+            cmd += "!"
+        return self.result(cmd)
+
+    def write32(self, addr, dword, confirm=True):
+        """GATED dword write to linear/physical memory or MMIO:
+        W<8hex addr><8hex dword>!  -> 'write ok' or 'write aborted'.
+        Reaches plain RAM and memory-mapped device registers (e.g. e1000 BAR0).
+        confirm=False omits '!' so the kernel refuses (gate self-test)."""
+        cmd = "W%08X%08X" % (addr & 0xFFFFFFFF, dword & 0xFFFFFFFF)
+        if confirm:
+            cmd += "!"
+        return self.result(cmd)
+
+    def mem32(self, addr):
+        """Read back a plain-RAM dword (little-endian) to verify a write landed."""
+        b = self.mem(addr, 4)
+        return int.from_bytes(b, "little") if b and len(b) == 4 else None
+
+    def mmio_lowbyte(self, addr):
+        """Read back an MMIO register's low byte. The `mem` reader returns each
+        device register's low byte replicated across the 4 lanes, so only the low
+        byte is recoverable this way - enough to verify an MMIO write took."""
+        b = self.mem(addr, 4)
+        return b[0] if b else None
+
     def pci_scan(self, buses=range(0, 6)):
         """Enumerate PCI devices: [{bus,dev,fn,vendor,device,classcode}]."""
         found = []
@@ -151,6 +198,12 @@ def _main():
         print(hw.mem(int(a[1], 16), int(a[2])).hex(" "))
     elif op == "in":
         print("0x%02X" % (hw.inb(int(a[1], 16)) or 0))
+    elif op == "out":                                    # GATED outb
+        print("outb 0x%04X <- 0x%02X : %s"
+              % (int(a[1], 16), int(a[2], 16), hw.outb(int(a[1], 16), int(a[2], 16))))
+    elif op == "write":                                  # GATED mem/MMIO dword write
+        print("write [0x%08X] <- 0x%08X : %s"
+              % (int(a[1], 16), int(a[2], 16), hw.write32(int(a[1], 16), int(a[2], 16))))
     else:
         print("unknown op", op)
 
