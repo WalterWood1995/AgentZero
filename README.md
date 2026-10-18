@@ -89,6 +89,16 @@ becomes the agent's face and keyboard, with no OS underneath:
 python agent_chat.py     # dev PC: answers questions on UDP 50001, replies to :50000
 ```
 
+Answers come from **Claude** (the Anthropic API) in character and sized for the 40-column
+screen, with a graceful fall-back to canned replies when no key is set. Put the key in
+`ANTHROPIC_API_KEY` or a gitignored `api_key.txt` (org-scoped keys also need
+`ANTHROPIC_WORKSPACE_ID` / `workspace_id.txt`).
+
+It also has a tiny **browser skill**: type `web <domain>` on the machine's own keyboard
+(e.g. `web en.wikipedia.org`, all lowercase + a dot, so no Shift keys are needed) and the
+page is fetched, boiled down by Claude, and painted on the left of the screen. From the dev
+PC: `python web.py <url>`.
+
 Three real-hardware gotchas, all fixed here:
 
 - **The BIOS steals your keystrokes.** Polling the 8042 from protected mode drops keys: the

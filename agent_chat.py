@@ -137,6 +137,16 @@ def answer(q):
     q = q.strip()
     if not q:
         return "..."
+    low = q.lower()
+    # "web <domain>" / "go <domain>" -> fetch that page and show a screen digest
+    if low.startswith("web ") or low.startswith("go "):
+        target = q.split(None, 1)[1].strip() if len(q.split(None, 1)) > 1 else ""
+        if target:
+            try:
+                import web
+                return web.web_answer(target, _client_get(), _ascii)
+            except Exception as e:
+                return "web error: %r" % e
     return llm_answer(q) or _canned(q)
 
 
