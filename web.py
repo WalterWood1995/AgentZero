@@ -21,6 +21,7 @@ import urllib.request
 OLD_PC = "192.168.178.114"      # the AgentZero machine
 R_PORT = 50000                  # its display port
 LEFT_W = 38                     # left column width (face is on the right)
+PANE_H = 14                     # pad to this many rows so it clears the previous reply
 
 SUMMARY_SYS = (
     "You are AgentZero, summarizing a web page for a 40-column bare-metal text screen. "
@@ -91,7 +92,9 @@ def _lines_payload(title, body):
     lines = [title[:40]]
     for ln in textwrap.wrap(body, LEFT_W) or ["(empty)"]:
         lines.append(ln)
-    lines = lines[:44]
+    lines = lines[:PANE_H]
+    while len(lines) < PANE_H:                   # pad so it clears the previous reply
+        lines.append("")
     return ("B00\n" + "\n".join(l.ljust(40)[:40] for l in lines)).encode("latin1")
 
 

@@ -17,6 +17,9 @@ import time
 Q_PORT = 50001          # we listen here (questions from the old PC)
 R_PORT = 50000          # kernel listens here (display commands)
 LEFT_W = 38             # left dialogue column width (face is on the right)
+PANE_H = 14             # left dialogue height: pad every reply to this many rows so a
+                        # shorter answer fully clears the previous one (stays < the
+                        # kernel's 760-byte UDP read buffer: 14*41 + 4 ~= 578 bytes)
 
 # Claude backend. Model is overridable with ANTHROPIC_MODEL in case the default
 # id isn't enabled on your account; on any API error we fall back to canned.
@@ -182,11 +185,14 @@ def main():
             else:
                 a = answer(q)
                 last.update(key=key, a=a, t=now)
-            # build left-column lines: question then wrapped answer
-            lines = ["Q: " + q][:1]
+            # build left-column lines: question then wrapped answer, padded to a
+            # fixed height so a shorter reply fully overwrites the previous one
+            lines = ["Q: " + q]
             for ln in textwrap.wrap("A: " + a, LEFT_W) or ["A:"]:
                 lines.append(ln)
-            lines = lines[:44]
+            lines = lines[:PANE_H]
+            while len(lines) < PANE_H:
+                lines.append("")
             # one block write, each line padded to clear the left column (not the face)
             payload = "B00\n" + "\n".join(l.ljust(40)[:40] for l in lines)
             for _ in range(4):                   # fire-and-forget with redundancy
