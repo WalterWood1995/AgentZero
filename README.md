@@ -99,6 +99,9 @@ It also has a tiny **browser skill**: type `web <domain>` on the machine's own k
 page is fetched, boiled down by Claude, and painted on the left of the screen. From the dev
 PC: `python web.py <url>`.
 
+**Talking face**: the dev PC also reads each answer aloud through Windows SAPI, so the ASCII
+portrait on the screen has a voice. Mute it with `AGENTZERO_TTS=0`.
+
 Three real-hardware gotchas, all fixed here:
 
 - **The BIOS steals your keystrokes.** Polling the 8042 from protected mode drops keys: the

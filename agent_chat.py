@@ -9,9 +9,12 @@
 # back to the built-in canned replies if there's no key or the call fails, so
 # the proven network loop never breaks.
 import os
+import queue
 import socket
+import subprocess
 import sys
 import textwrap
+import threading
 import time
 
 Q_PORT = 50001          # we listen here (questions from the old PC)
@@ -153,7 +156,43 @@ def answer(q):
     return llm_answer(q) or _canned(q)
 
 
+# ---- the talking face: speak each answer on the dev PC (Windows SAPI) ----
+# One worker thread plays queued answers in order so they never overlap; text is
+# piped in via stdin so punctuation never breaks the command. Disable with
+# AGENTZERO_TTS=0. Non-Windows hosts just skip it.
+_tts_q = queue.Queue(maxsize=4)
+_TTS_ON = os.environ.get("AGENTZERO_TTS", "1") != "0" and sys.platform == "win32"
+_PS_SPEAK = ("Add-Type -AssemblyName System.Speech;"
+             "$v=New-Object System.Speech.Synthesis.SpeechSynthesizer;"
+             "$v.Rate=1;$v.Speak([Console]::In.ReadToEnd())")
+
+
+def _tts_worker():
+    while True:
+        text = _tts_q.get()
+        try:
+            subprocess.run(["powershell", "-NoProfile", "-Command", _PS_SPEAK],
+                           input=text, text=True, timeout=90,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            print("tts error (ignored): %r" % e, flush=True)
+        finally:
+            _tts_q.task_done()
+
+
+def speak(text):
+    if not _TTS_ON or not text:
+        return
+    try:
+        _tts_q.put_nowait(text[:400])            # cap length; drop if the queue is full
+    except queue.Full:
+        pass
+
+
 def main():
+    if _TTS_ON:
+        threading.Thread(target=_tts_worker, daemon=True).start()
+        print("talking face: TTS on (AGENTZERO_TTS=0 to mute)", flush=True)
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind(("0.0.0.0", Q_PORT))
@@ -185,6 +224,7 @@ def main():
             else:
                 a = answer(q)
                 last.update(key=key, a=a, t=now)
+                speak(a)                         # the talking face reads new answers aloud
             # build left-column lines: question then wrapped answer, padded to a
             # fixed height so a shorter reply fully overwrites the previous one
             lines = ["Q: " + q]
