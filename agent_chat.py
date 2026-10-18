@@ -156,20 +156,42 @@ def answer(q):
     return llm_answer(q) or _canned(q)
 
 
-# ---- the talking face: speak each answer on the dev PC (Windows SAPI) ----
+# ---- the talking face: speak each answer on the dev PC (Windows SAPI), and
+# flap the portrait's mouth on the old PC's screen while it speaks ----
 # One worker thread plays queued answers in order so they never overlap; text is
 # piped in via stdin so punctuation never breaks the command. Disable with
 # AGENTZERO_TTS=0. Non-Windows hosts just skip it.
+try:
+    import face_anim                             # mouth animation over UDP (no cycle)
+except Exception:
+    face_anim = None
+_anim_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+_last_peer = [None]                              # the old PC's IP (set per question)
 _tts_q = queue.Queue(maxsize=4)
 _TTS_ON = os.environ.get("AGENTZERO_TTS", "1") != "0" and sys.platform == "win32"
-_PS_SPEAK = ("Add-Type -AssemblyName System.Speech;"
-             "$v=New-Object System.Speech.Synthesis.SpeechSynthesizer;"
-             "$v.Rate=1;$v.Speak([Console]::In.ReadToEnd())")
+# Pick an English voice (the OS default is the system-locale voice - German here,
+# which mangles English). Override with AGENTZERO_VOICE="Microsoft Zira Desktop".
+_PS_SPEAK = (
+    "Add-Type -AssemblyName System.Speech;"
+    "$v=New-Object System.Speech.Synthesis.SpeechSynthesizer;"
+    "$want=$env:AGENTZERO_VOICE;"
+    "if($want){try{$v.SelectVoice($want)}catch{}}"
+    "else{$en=$v.GetInstalledVoices()|"
+    "?{$_.Enabled -and $_.VoiceInfo.Culture.TwoLetterISOLanguageName -eq 'en'}|"
+    "Select-Object -First 1; if($en){$v.SelectVoice($en.VoiceInfo.Name)}}"
+    "$v.Rate=1;$v.Speak([Console]::In.ReadToEnd())")
 
 
 def _tts_worker():
     while True:
         text = _tts_q.get()
+        peer = _last_peer[0]
+        stop = threading.Event()
+        flap_t = None
+        if face_anim and peer:                   # flap the mouth while it speaks
+            flap_t = threading.Thread(target=face_anim.flap,
+                                      args=(_anim_sock, peer, stop), daemon=True)
+            flap_t.start()
         try:
             subprocess.run(["powershell", "-NoProfile", "-Command", _PS_SPEAK],
                            input=text, text=True, timeout=90,
@@ -177,6 +199,9 @@ def _tts_worker():
         except Exception as e:
             print("tts error (ignored): %r" % e, flush=True)
         finally:
+            stop.set()                           # stop flapping, close the mouth
+            if flap_t:
+                flap_t.join(timeout=1.5)
             _tts_q.task_done()
 
 
@@ -217,6 +242,7 @@ def main():
         try:
             q = data.decode("latin1", "replace")
             print("Q from %s:%d  (%d bytes): %r" % (addr[0], addr[1], len(data), q), flush=True)
+            _last_peer[0] = addr[0]              # the old PC, for the talking-face mouth
             key = (addr[0], q)
             now = time.time()
             if key == last["key"] and now - last["t"] < 4.0:

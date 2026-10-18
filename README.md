@@ -99,8 +99,11 @@ It also has a tiny **browser skill**: type `web <domain>` on the machine's own k
 page is fetched, boiled down by Claude, and painted on the left of the screen. From the dev
 PC: `python web.py <url>`.
 
-**Talking face**: the dev PC also reads each answer aloud through Windows SAPI, so the ASCII
-portrait on the screen has a voice. Mute it with `AGENTZERO_TTS=0`.
+**Talking face**: the dev PC reads each answer aloud through Windows SAPI (an English voice),
+and while it speaks, `face_anim.py` flaps the ASCII portrait's mouth on the screen with
+positioned `S` writes - so the face has a voice *and* moves its mouth, then closes it when
+done. All driven over UDP, no kernel change. Mute the voice with `AGENTZERO_TTS=0`; tune the
+mouth with `MOUTH_ROWS` / `MOUTH_C0` / `MOUTH_C1`.
 
 Three real-hardware gotchas, all fixed here:
 
