@@ -1153,6 +1153,7 @@ set_cursor:
 kbd_service:
     push ecx
     push edx
+    push ebx
     mov ecx, 24                    ; bound the drain per iteration
 .ks:
     in  al, 0x64
@@ -1167,10 +1168,23 @@ kbd_service:
     call hud_byte
     cmp al, 0xE0                   ; extended-key prefix (arrows etc.)?
     je  .ksext
+    cmp al, 0x2A                   ; left shift pressed
+    je  .ksshon
+    cmp al, 0x36                   ; right shift pressed
+    je  .ksshon
+    cmp al, 0xAA                   ; left shift released
+    je  .ksshoff
+    cmp al, 0xB6                   ; right shift released
+    je  .ksshoff
     test al, 0x80                  ; break (release) code?
     jnz .ksnext
     movzx eax, al
-    mov al, [scancode_map + eax]
+    mov ebx, scancode_map
+    cmp byte [shift_state], 0
+    je  .ksmap
+    mov ebx, scancode_shift        ; shifted layer: uppercase + URL symbols (: / _ ?)
+.ksmap:
+    mov al, [ebx + eax]
     test al, al                    ; unmapped key?
     jz  .ksnext
     call kbd_char                  ; echo / handle the character
@@ -1178,9 +1192,16 @@ kbd_service:
     dec ecx
     jnz .ks
 .ksret:
+    pop ebx
     pop edx
     pop ecx
     ret
+.ksshon:
+    mov byte [shift_state], 1
+    jmp .ksnext
+.ksshoff:
+    mov byte [shift_state], 0
+    jmp .ksnext
 .ksaux:
     in  al, 0x60                   ; discard aux byte
     jmp .ksnext
@@ -1962,6 +1983,7 @@ rx_buf    times 768 db 0           ; received command packet
 tx_buf    times 512 db 0           ; reply payload
 kbd_len   dd 0
 kbd_buf   times 128 db 0           ; typed line (the user's question)
+shift_state db 0                   ; 1 while a Shift key is held
 align 2
 scancode_map:                      ; PS/2 set-1 make code -> ASCII, German QWERTZ
     db 0, 0                                               ; 00 esc
@@ -1979,6 +2001,23 @@ scancode_map:                      ; PS/2 set-1 make code -> ASCII, German QWERT
     db 0, 0, 0                                             ; 36-38 rshift/kp*/lalt
     db ' '                                                ; 39 space
     times 128-($-scancode_map) db 0
+align 2
+scancode_shift:                    ; Shift held: uppercase + German-position symbols
+    db 0, 0                                               ; 00 esc
+    db '!','"','#','$','%','&','/','(',')','=','?','`'     ; 02-0D (7->'/', ss->'?')
+    db 8                                                  ; 0E backspace
+    db 0                                                  ; 0F tab
+    db 'Q','W','E','R','T','Z','U','I','O','P',0,'*'       ; 10-1B
+    db 13                                                 ; 1C enter
+    db 0                                                  ; 1D lctrl
+    db 'A','S','D','F','G','H','J','K','L',':','"'         ; 1E-28 (;->':')
+    db 0                                                  ; 29
+    db 0                                                  ; 2A lshift
+    db 39                                                 ; 2B  (#->apostrophe)
+    db 'Y','X','C','V','B','N','M',';',':','_'             ; 2C-35 (,->';' .->':' -->'_')
+    db 0, 0, 0                                             ; 36-38
+    db ' '                                                ; 39 space
+    times 128-($-scancode_shift) db 0
 align 4
 pxe_param times 128 db 0           ; PXE API parameter struct buffer (seg 0)
 s_udpopen db "UDP_OPEN ax=",0
