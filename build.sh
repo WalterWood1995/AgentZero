@@ -22,15 +22,23 @@ fi
 
 # IMAGE_DEMO=1 builds the graphics (VBE framebuffer photo) kernel instead of the
 # default text face/chat kernel. Only stage2 differs.
+# ARCADE=1 builds the game-console kernel (arcade.asm: PS/2 key table + 60 fps
+# loop + Pong + Fight). It needs a bigger stage2, so the sector budget define is
+# passed to all three sources (stage1 / stage2 / pxe_stage1 must agree).
 S2DEF=""
+DEFS=""
 if [ -n "${IMAGE_DEMO:-}" ]; then
     S2DEF="-dIMAGE_DEMO"
     echo "building IMAGE_DEMO (VBE graphics) kernel"
 fi
+if [ -n "${ARCADE:-}" ]; then
+    DEFS="-dARCADE"
+    echo "building ARCADE (game console) kernel"
+fi
 
-"$NASM" -f bin "$SRC/stage1.asm" -o "$SRC/stage1.bin"
-"$NASM" -f bin $S2DEF "$SRC/stage2.asm" -o "$SRC/stage2.bin"
-"$NASM" -f bin "$SRC/pxe_stage1.asm" -o "$SRC/pxe_stage1.bin"
+"$NASM" -f bin $DEFS "$SRC/stage1.asm" -o "$SRC/stage1.bin"
+"$NASM" -f bin $S2DEF $DEFS "$SRC/stage2.asm" -o "$SRC/stage2.bin"
+"$NASM" -f bin $DEFS "$SRC/pxe_stage1.asm" -o "$SRC/pxe_stage1.bin"
 cat "$HERE/stage1.bin" "$HERE/stage2.bin" > "$HERE/disk.img"          # USB / raw disk
 cat "$HERE/pxe_stage1.bin" "$HERE/stage2.bin" > "$HERE/pxe.img"       # PXE network boot
 echo "disk.img: $(stat -c %s "$HERE/disk.img") bytes ($(( $(stat -c %s "$HERE/disk.img") / 512 )) sectors)"

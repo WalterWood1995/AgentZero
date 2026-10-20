@@ -40,9 +40,11 @@ SCR_CELLS equ 80 * SCR_ROWS
 RAIN_FRAMES equ 170                ; how many animation frames the intro runs
 FRAME_COUNTS equ 29800             ; PIT ch0 counts per frame (~25 ms, CPU-independent)
 %ifdef NIC_NATIVE
-STAGE2_SECTORS equ 40              ; native build is larger (e1000 driver + IP/UDP)
+STAGE2_SECTORS equ 42              ; native build is larger (e1000/AR8131 driver + IP/UDP)
+%elifdef ARCADE
+STAGE2_SECTORS equ 48              ; arcade build: + game console (arcade.asm)
 %else
-STAGE2_SECTORS equ 35              ; must match stage1.asm / pxe_stage1.asm (sector budget)
+STAGE2_SECTORS equ 36              ; must match stage1.asm / pxe_stage1.asm (sector budget)
 %endif
 ; --- Fourier "epicycle" compute (the old PC's CPU does the real fixed-point maths) ---
 ; The Agent preloads, into free high RAM (not part of the kernel image), a small
@@ -78,6 +80,11 @@ stage2:
     ; ---- image demo: switch to a VBE linear-framebuffer graphics mode now
     ; (while BIOS VBE is fully available in real mode). Loses the text console;
     ; the whole screen becomes a pixel surface the Agent draws photos into. ----
+    call vbe_setup
+%elifdef ARCADE
+    ; ---- arcade: straight into the VBE framebuffer (game console). Grab the ROM
+    ; 8x8 font first (text mode is still up) for on-screen score/text. ----
+    call extract_font
     call vbe_setup
 %else
     call pit_init16                ; PIT ch0 timebase for the opening animation
@@ -532,6 +539,9 @@ pm_entry:
 %ifdef IMAGE_DEMO
     jmp image_demo_pm              ; graphics mode is set; go draw pixels
 %endif
+%ifdef ARCADE
+    jmp arcade_pm                  ; game console: fixed-rate input->update->render loop
+%endif
     call pit_init                  ; free-running PIT ch0 timebase (QEMU==real HW)
     call uart_detect               ; is COM1 real? (K50IJ has no serial port)
     ; The opening animation already drew the face in real mode. Here we only do
@@ -639,6 +649,8 @@ exec_line:
     je  do_alu
     cmp al, 'J'
     je  do_rd32
+    cmp al, 'H'
+    je  do_keys_held
     cmp al, '?'
     je  do_help
     mov esi, s_unknown
@@ -1350,6 +1362,25 @@ do_alu:
     call nl
     jmp exec_done
 
+; ---- H: list the scancodes currently held down (debug for the key table) ----
+do_keys_held:
+    mov esi, s_keys
+    call out_puts
+    xor ebx, ebx
+.hk:
+    cmp byte [key_state + ebx], 0
+    je  .hn
+    mov eax, ebx
+    call print_hex8
+    mov al, ' '
+    call out_putc
+.hn:
+    inc ebx
+    cmp ebx, 256
+    jb  .hk
+    call nl
+    jmp exec_done
+
 do_help:
     mov esi, s_help
     call out_puts
@@ -1781,6 +1812,7 @@ kbd_service:
     test al, 0x20                  ; aux (mouse) byte?
     jnz .ksaux
     in  al, 0x60                   ; scancode
+    call kbd_track                 ; maintain the pressed/released key table
     mov edi, VGA + HUD_CELL + 6     ; HUD: scancode at col 3
     call hud_byte
     cmp al, 0xE0                   ; extended-key prefix (arrows etc.)?
@@ -1832,8 +1864,87 @@ kbd_service:
     jnz .ksew
     jmp .ksnext
 .ksec:
-    in  al, 0x60                   ; discard the extended code
+    in  al, 0x60                   ; discard the extended code (but track its state)
+    call kbd_track
     jmp .ksnext
+
+; kbd_track: AL = one raw byte from port 0x60 -> update key_state[] (the
+; pressed/released table games poll). Index = set-1 make code (0..0x7F), or
+; 0x80|code for E0-prefixed (extended) keys such as the arrows. Handles the E0
+; prefix, the set-2 F0 break prefix (in case translation is off), and ignores
+; the E1 (pause) prefix and the FA/FE/FF ack/resend/error bytes. Preserves all.
+kbd_track:
+    push eax
+    push ebx
+    cmp al, 0xE0
+    je  .ext
+    cmp al, 0xE1
+    je  .done
+    cmp al, 0xF0
+    je  .brk
+    cmp al, 0xFA
+    jae .done
+    movzx ebx, al
+    mov ah, al
+    and ah, 0x80                   ; set-1 break bit
+    and ebx, 0x7F
+    cmp byte [kbd_e0], 0
+    je  .n1
+    or  ebx, 0x80                  ; extended key -> upper half of the table
+    mov byte [kbd_e0], 0
+.n1:
+    cmp byte [kbd_f0], 0
+    je  .n2
+    mov ah, 0x80                   ; F0-prefixed = release
+    mov byte [kbd_f0], 0
+.n2:
+    test ah, ah
+    jnz .rel
+    mov byte [key_state + ebx], 1
+    jmp .done
+.rel:
+    mov byte [key_state + ebx], 0
+    jmp .done
+.ext:
+    mov byte [kbd_e0], 1
+    jmp .done
+.brk:
+    mov byte [kbd_f0], 1
+.done:
+    pop ebx
+    pop eax
+    ret
+
+; kbd_drain: read every byte waiting in the 8042 output buffer into kbd_track
+; (no echo, no line editing - the game layer reads key_state directly). Also
+; records the raw controller status and last scancode for on-screen diagnostics.
+; Bounded per call. Preserves all registers.
+kbd_drain:
+    push eax
+    push ecx
+    mov ecx, 32
+.d:
+    in  al, 0x64
+    mov [kbd_last_status], al
+    test al, 1
+    jz  .q
+    test al, 0x20                  ; aux (mouse) byte -> discard
+    jnz .aux
+    in  al, 0x60
+    mov [kbd_last_sc], al
+    call kbd_track
+    inc dword [kbd_byte_count]
+    dec ecx
+    jnz .d
+    jmp .q
+.aux:
+    in  al, 0x60
+    dec ecx
+    jnz .d
+.q:
+    pop ecx
+    pop eax
+    ret
 
 ; kbd_char: handle a typed character in AL (echo on the input line; Enter sends).
 kbd_char:
@@ -2896,6 +3007,14 @@ tx_buf    times 1536 db 0          ; reply payload (fits a 301-point Fourier rep
 kbd_len   dd 0
 kbd_buf   times 128 db 0           ; typed line (the user's question)
 shift_state db 0                   ; 1 while a Shift key is held
+kbd_e0      db 0                   ; kbd_track: E0 prefix seen, next byte is extended
+kbd_f0      db 0                   ; kbd_track: F0 prefix seen, next byte is a release
+kbd_last_status db 0               ; kbd_drain: last 8042 status byte (diagnostics)
+kbd_last_sc db 0                   ; kbd_drain: last raw scancode byte (diagnostics)
+align 4
+kbd_byte_count dd 0                ; kbd_drain: total scancode bytes seen
+key_state   times 256 db 0         ; 1 = key held. [code] set-1 make code, [0x80|code] E0 keys
+s_keys      db "keys:",0
 align 2
 scancode_map:                      ; PS/2 set-1 make code -> ASCII, German QWERTZ
     db 0, 0                                               ; 00 esc
@@ -3011,5 +3130,9 @@ BITS 32
 %endif
 %endif
 %include "face_data.inc"            ; Dario portrait baked into the kernel
+%ifdef ARCADE
+BITS 32
+%include "arcade.asm"               ; game console: PS/2 input + frame loop + Pong + Fight
+%endif
 
     times (STAGE2_SECTORS*512)-($-$$) db 0
