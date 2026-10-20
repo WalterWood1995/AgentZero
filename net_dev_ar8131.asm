@@ -2,11 +2,23 @@
 ; The old Asus's NIC. Provides dev_init / dev_send / dev_rx_get. Register map and
 ; descriptor formats from the Linux atl1c driver (atl1c_hw.h / atl1c.h).
 ;
-; STRATEGY (first cut): the PXE firmware already reset the chip, brought the PHY/link
-; up and set DMA/speed, so we do a MINIMAL TAKEOVER - stop the queues, repoint the
-; descriptor rings at ours, re-enable - instead of a full reset + PHY bring-up (which
-; needs several constants not in the public header). If this proves unreliable the
-; fallback is a full atl1c-style reset.
+; STRATEGY (round 3): full atl1c-style bring-up INCLUDING PHY init over MDIO.
+; Rounds 1-2 (minimal takeover and bare soft-reset) left the TPD consumer index
+; stuck at 0 = TX DMA never ran. PXE/UNDI drives the chip through its own firmware
+; path and never programs the standard atl1c TXQ/ring engine (J reads showed
+; TXQ_CTRL=0, rings unconfigured), so there is nothing to inherit - we must build
+; the whole TX path. The missing piece was the PHY: toggling the MAC/queues drops
+; the GMII link, and with no PHY init the TX MAC has no clock, so the consumer
+; index never advances. This cut does: MAC+DMA soft reset -> PHY reset via GPHY_CTRL
+; -> advertise + restart autoneg over MDIO -> poll link up, read speed/duplex from
+; MII_GIGA_PSSR -> program rings + DMA + TXQ/RXQ -> MAC_CTRL with the resolved
+; speed/duplex. A rich HUD (PSSR/BMSR/IDLE) makes the live link state readable from
+; a single photo when TX still fails.
+;
+; Build knobs:
+;   -dAR_NOPHY   skip the GPHY reset + autoneg (keep PXE's live PHY/link), still
+;                read PSSR for speed/duplex. Use to bisect PHY-reset vs ring issues.
+;   -dAR_NORESET skip the MAC soft reset (pure minimal takeover). Diagnostic only.
 ;
 ; Rings (TPD=TX, RFD=RX free buffers, RRD=RX return/completion):
 AR_TPD    equ 0x00090000           ; 64 x 16B transmit packet descriptors
@@ -17,6 +29,9 @@ AR_CNT    equ 64
 
 ; registers (atl1c)
 R_MASTER  equ 0x1400
+R_IDLE    equ 0x1410            ; IDLE_STATUS (poll after soft reset)
+R_GPHY    equ 0x140C            ; GPHY_CTRL (PHY power + reset)
+R_MDIO    equ 0x1414            ; MDIO_CTRL (MII management access)
 R_LOADPTR equ 0x1534
 R_RXBASEHI equ 0x1540
 R_TXBASEHI equ 0x1544
@@ -32,16 +47,55 @@ R_TPD_SZ  equ 0x1584
 R_TXQ     equ 0x1590
 R_RXQ     equ 0x15A0
 R_RFD_PIDX equ 0x15E0            ; 16-bit RFD producer index mailbox
-R_TPD_PIDX equ 0x15F2            ; 16-bit TPD producer index
-R_TPD_CIDX equ 0x15F6            ; 16-bit TPD consumer index
+R_TPD_PIDX equ 0x15F2            ; 16-bit prio0 TPD producer index
+R_TPD_CIDX equ 0x15F6            ; 16-bit prio0 TPD consumer index
 R_IMR     equ 0x1604
 R_ISR     equ 0x1600
 R_DMACTRL equ 0x15C0
-R_MASTER_SOFT_RST equ 0x1
+
+; MASTER_CTRL bits
+MASTER_SOFT_RST equ 0x1
+MASTER_OOB_DIS  equ 0x40
+MASTER_SA_TIMER equ 0x80
+
+; MDIO_CTRL bits (clause 22, internal PHY, clk 25/4 = 0)
+MDIO_SPRES   equ 0x00400000      ; BIT(22) suppress preamble
+MDIO_OP_READ equ 0x00200000      ; BIT(21) 1=read 0=write
+MDIO_START   equ 0x00800000      ; BIT(23)
+MDIO_BUSY    equ 0x08000000       ; BIT(27)
+MDIO_REG_SH  equ 16              ; reg addr << 16 (mask 0x1F)
+
+; GPHY_CTRL bits
+GPHY_EXT_RESET  equ 0x0001        ; BIT(0)  out of DSP reset
+GPHY_GATE_25M   equ 0x0020        ; BIT(5)
+GPHY_PHY_IDDQ   equ 0x0080        ; BIT(7)  power down
+GPHY_IDDQ_DIS   equ 0x0100        ; BIT(8)
+GPHY_SEL_ANA    equ 0x1000        ; BIT(12) select analog reset
+GPHY_PLL_ON     equ 0x2000        ; BIT(13) PLL always on
+GPHY_PWDOWN_HW  equ 0x4000        ; BIT(14)
+GPHY_PLL_BYPASS equ 0x8000        ; BIT(15)
+
+; MII (clause-22) register numbers + bits
+MII_BMCR     equ 0                ; control
+MII_BMSR     equ 1                ; status (BMSR_LSTATUS 0x0004)
+MII_ADV      equ 4               ; autoneg advertisement
+MII_CTRL1000 equ 9               ; 1000BASE-T control
+MII_PSSR     equ 0x11            ; GIGA PHY-specific status
+BMCR_RESTART equ 0x9200          ; RESET|ANENABLE|ANRESTART (0x8000|0x1000|0x0200)
+ADV_10_100   equ 0x0DE1          ; CSMA|10H|10F|100H|100F|PAUSE|PAUSE_ASYM
+ADV_1000     equ 0x0300          ; 1000 full + half
+PSSR_RESOLVED equ 0x0800
+PSSR_DPLX     equ 0x2000
+PSSR_SPEED    equ 0xC000
+PSSR_1000     equ 0x8000
+PSSR_100      equ 0x4000
 
 dev_init:
     call ar_pci_find                 ; 1969:1026 -> ar_mmio, enable bus master
-    ; ---- MAC address (atl1c layout) ----
+    jnc .present
+    ret                              ; NIC absent (e.g. QEMU): skip init, no stray MMIO
+.present:
+    ; ---- MAC address (atl1c layout) ---- read before any reset
     mov ebx, R_MACADDR               ; d0 = mac[2..5]
     call ar_rd32
     mov [ar_macraw], eax
@@ -54,56 +108,54 @@ dev_init:
     mov eax, [ar_macraw]
     bswap eax                        ; eax = mac2 mac3 mac4 mac5 (now in byte order)
     mov [nn_mac + 2], eax            ; stores mac2..mac5
-    ; ---- capture PXE's working config BEFORE reset (so we reuse its magic values) ----
-    mov ebx, R_DMACTRL
-    call ar_rd32
-    mov [ar_dmactrl], eax
+    ; ---- stop the engines (so the soft reset is clean) ----
     mov ebx, R_TXQ
     call ar_rd32
-    mov [ar_txqcfg], eax
-    mov ebx, R_RXQ
-    call ar_rd32
-    mov [ar_rxqcfg], eax
-    mov ebx, R_MACCTRL
-    call ar_rd32
-    mov [ar_macctrl], eax            ; keep PXE's speed/duplex bits
-    ; ---- stop the engines ----
-    mov eax, [ar_txqcfg]
     and eax, ~0x20
     mov ebx, R_TXQ
     call ar_wr32
-    mov eax, [ar_rxqcfg]
+    mov ebx, R_RXQ
+    call ar_rd32
     and eax, ~0x80000000
     mov ebx, R_RXQ
     call ar_wr32
-    mov eax, [ar_macctrl]
+    mov ebx, R_MACCTRL
+    call ar_rd32
     and eax, ~0x3
     mov ebx, R_MACCTRL
     call ar_wr32
     mov ecx, 0x00400000
 .s0: dec ecx
     jnz .s0
-%ifdef AR_RESET
-    ; ---- soft reset MAC + DMA (OFF by default: it drops the PHY link and we don't
-    ; re-init the PHY; minimal-takeover keeps PXE's live link/PHY/DMA instead) ----
+%ifndef AR_NORESET
+    ; ---- soft reset MAC + DMA, then wait for all engines idle ----
+    mov eax, MASTER_OOB_DIS | MASTER_SOFT_RST
     mov ebx, R_MASTER
-    call ar_rd32
-    mov edx, eax
-    or  eax, 0x1                     ; MASTER_CTRL_SOFT_RST
     call ar_wr32
-    mov ecx, 0x02000000
+    mov ecx, 0x00800000              ; settle
 .s1: dec ecx
     jnz .s1
-    mov eax, edx
+    mov esi, 200000                  ; poll IDLE_STATUS until TXQ/RXQ/TXMAC/RXMAC idle
+.iw:
+    mov ebx, R_IDLE
+    call ar_rd32
+    mov [ar_idle], eax
+    test eax, 0x0F
+    jz  .idle_ok
+    dec esi
+    jnz .iw
+.idle_ok:
+    mov eax, MASTER_OOB_DIS | MASTER_SA_TIMER   ; clear SOFT_RST
     mov ebx, R_MASTER
     call ar_wr32
-    mov ecx, 0x02000000
-.s2: dec ecx
-    jnz .s2
-    mov eax, [ar_dmactrl]            ; restore DMA config after reset
-    mov ebx, R_DMACTRL
-    call ar_wr32
-    movzx eax, byte [nn_mac + 2]     ; re-write MAC (reset cleared it)
+%endif
+%ifndef AR_NOPHY
+    call ar_phy_reset                ; take the PHY out of power-down + ext reset
+    call ar_phy_autoneg              ; advertise 10/100/1000, restart autoneg
+%endif
+    call ar_link_wait                ; poll MII_GIGA_PSSR -> ar_link_up/ar_speed/ar_duplex
+    ; ---- re-write MAC address (soft reset cleared the station address) ----
+    movzx eax, byte [nn_mac + 2]
     shl eax, 8
     mov al, [nn_mac + 3]
     shl eax, 8
@@ -117,7 +169,6 @@ dev_init:
     mov al, [nn_mac + 1]
     mov ebx, R_MACADDR + 4
     call ar_wr32
-%endif
     ; ---- disable interrupts ----
     mov ebx, R_IMR
     xor eax, eax
@@ -167,24 +218,38 @@ dev_init:
     inc ecx
     cmp ecx, AR_CNT
     jb  .rfill
+    ; ---- DMA config (PXE's known-good value for this chip) ----
+    mov eax, 0x00647C24
+    mov ebx, R_DMACTRL
+    call ar_wr32
     ; ---- latch ring base/size ----
     mov ebx, R_LOADPTR
     mov eax, 1
     call ar_wr32
-    ; ---- re-enable queues + MAC with the PROPER atl1c config (PXE's TXQ/RXQ regs
-    ; read 0 / C0000000 because UNDI doesn't use the atl1c ring engine - restoring
-    ; those left TX unconfigured, which is why the TX consumer never advanced) ----
+    ; ---- enable queues with the proper atl1c config ----
     mov eax, 0x020000F5             ; L1C_TXQ_CFGV (0x020000D5) | TXQ_CTRL_EN (0x20)
     mov ebx, R_TXQ
     call ar_wr32
     mov eax, 0x80800000             ; RXQ_CTRL_EN (0x80000000) | rfd_burst 8<<20
     mov ebx, R_RXQ
     call ar_wr32
-    mov eax, [ar_macctrl]
-    or  eax, 0x3 | 0x40 | 0x80 | 0x4000000   ; TX_EN|RX_EN|ADD_CRC|PAD|BC_EN
+    ; ---- MAC_CTRL: TX/RX enable + CRC/PAD/BC + resolved speed/duplex ----
+    mov eax, 0x3 | 0x40 | 0x80 | 0x4000000   ; TX_EN|RX_EN|ADD_CRC|PAD|BC_EN
+    or  eax, (7 << 10)                        ; preamble length 7
+    cmp dword [ar_speed], 1000
+    jne .sp10100
+    or  eax, (2 << 20)                        ; MAC_CTRL_SPEED_1000
+    jmp .spdone
+.sp10100:
+    or  eax, (1 << 20)                        ; MAC_CTRL_SPEED_10_100
+.spdone:
+    cmp byte [ar_duplex], 0
+    je  .hd
+    or  eax, 0x20                             ; MAC_CTRL_DUPLX (full)
+.hd:
     mov ebx, R_MACCTRL
     call ar_wr32
-    mov ecx, 0x02000000              ; let the link/MAC settle after reset
+    mov ecx, 0x02000000              ; let the MAC settle
 .s3: dec ecx
     jnz .s3
     ; ---- hand all RX buffers to the NIC ----
@@ -196,7 +261,119 @@ dev_init:
     mov word [ar_rfd_prod], AR_CNT - 1
     ret
 
+; ---- PHY: take it out of power-down and pulse the external (DSP) reset ----
+ar_phy_reset:
+    mov ebx, R_GPHY
+    call ar_rd32
+    and eax, ~(GPHY_EXT_RESET | GPHY_PHY_IDDQ | GPHY_GATE_25M | GPHY_PWDOWN_HW | GPHY_PLL_BYPASS)
+    or  eax, GPHY_IDDQ_DIS | GPHY_PLL_ON | GPHY_SEL_ANA
+    mov edx, eax                     ; remember (ar_wr32 preserves edx)
+    mov ebx, R_GPHY
+    call ar_wr32
+    mov ecx, 0x01000000              ; ~10ms
+.p0: dec ecx
+    jnz .p0
+    mov eax, edx
+    or  eax, GPHY_EXT_RESET
+    mov ebx, R_GPHY
+    call ar_wr32
+    mov ecx, 0x04000000              ; ~50ms for the DSP reset to lift
+.p1: dec ecx
+    jnz .p1
+    ret
+
+; ---- PHY: advertise 10/100/1000 and restart autonegotiation ----
+ar_phy_autoneg:
+    mov bl, MII_ADV
+    mov cx, ADV_10_100
+    call ar_mdio_write
+    mov bl, MII_CTRL1000
+    mov cx, ADV_1000
+    call ar_mdio_write
+    mov bl, MII_BMCR
+    mov cx, BMCR_RESTART
+    call ar_mdio_write
+    ret
+
+; ---- poll MII_GIGA_PSSR until speed/duplex resolved; fill ar_* state ----
+ar_link_wait:
+    mov dword [ar_link_up], 0
+    mov dword [ar_speed], 0
+    mov byte [ar_duplex], 0
+    mov esi, 1500                    ; ~1500 polls * ~2ms ~= 3s
+.lw:
+    mov bl, MII_PSSR
+    call ar_mdio_read                ; -> AX = PSSR
+    mov [ar_pssr], ax
+    test ax, PSSR_RESOLVED
+    jz  .notyet
+    mov dword [ar_link_up], 1
+    test ax, PSSR_DPLX
+    jz  .half
+    mov byte [ar_duplex], 1
+.half:
+    mov dx, ax
+    and dx, PSSR_SPEED
+    cmp dx, PSSR_1000
+    je  .g1000
+    cmp dx, PSSR_100
+    je  .g100
+    mov dword [ar_speed], 10
+    ret
+.g100:
+    mov dword [ar_speed], 100
+    ret
+.g1000:
+    mov dword [ar_speed], 1000
+    ret
+.notyet:
+    mov ecx, 0x00400000              ; ~2ms
+.d: dec ecx
+    jnz .d
+    dec esi
+    jnz .lw
+    ret                              ; timeout: ar_link_up stays 0
+
+; ---- MDIO (clause 22). read: BL=reg -> AX ; write: BL=reg, CX=data ----
+ar_mdio_read:
+    movzx eax, bl
+    and eax, 0x1F
+    shl eax, MDIO_REG_SH
+    or  eax, MDIO_SPRES | MDIO_START | MDIO_OP_READ
+    mov ebx, R_MDIO
+    call ar_wr32
+    mov ecx, 0x00100000
+.w: mov ebx, R_MDIO
+    call ar_rd32
+    test eax, MDIO_BUSY | MDIO_START
+    jz  .done
+    dec ecx
+    jnz .w
+.done:
+    and eax, 0xFFFF
+    ret
+ar_mdio_write:
+    movzx eax, cx
+    movzx edx, bl
+    and edx, 0x1F
+    shl edx, MDIO_REG_SH
+    or  eax, edx
+    or  eax, MDIO_SPRES | MDIO_START
+    mov ebx, R_MDIO
+    call ar_wr32
+    mov ecx, 0x00100000
+.w: mov ebx, R_MDIO
+    call ar_rd32
+    test eax, MDIO_BUSY | MDIO_START
+    jz  .done
+    dec ecx
+    jnz .w
+.done:
+    ret
+
 dev_send:                            ; EAX = frame length in NN_TXBUF
+    cmp byte [ar_present], 0
+    je  .done                        ; NIC absent: nothing to transmit
     mov [ar_txlen], eax
     movzx edi, word [ar_tpd_prod]
     mov edx, edi
@@ -228,6 +405,8 @@ dev_send:                            ; EAX = frame length in NN_TXBUF
     ret
 
 dev_rx_get:                          ; -> CF=0 with nn_frame/nn_flen set, or CF=1
+    cmp byte [ar_present], 0
+    je  .none                        ; NIC absent: ring always empty
     movzx esi, word [ar_rrd_clean]
     mov edx, esi
     shl edx, 4
@@ -365,6 +544,7 @@ ar_pci_find:                         ; AR8131 is on bus 3 on the Asus; scan buse
     stc
     ret
 .found:
+    mov byte [ar_present], 1
     mov byte [ar_pci_off], 0x04      ; bus master + memory space
     call ar_pci_read
     or  eax, 0x0006
@@ -379,10 +559,66 @@ ar_pci_find:                         ; AR8131 is on bus 3 on the Asus; scan buse
     ret
 
 ; ---- on-screen diagnostic HUD (bottom rows of the 80x50 text console) ----
-; Shows: M<mmio> A<our MAC> C<live MAC_CTRL> T<TPD consumer idx> R<RRD[0].word3>.
-; TPD consumer != 0 means a TX completed; RRD word3 bit31 means a frame was received.
+; Row 48: M<mmio> A<our MAC> C<live MAC_CTRL> T<TPD consumer idx> R<RRD[0].word3>
+;         Q<live TXQ_CTRL> B<TPD base readback>.
+; Row 47: P<live PSSR> L<BMSR> U<link_up> S<speed/100> I<IDLE_STATUS> D<DMA_CTRL>.
+; TPD consumer != 0 => a TX completed. PSSR bit11 (0x0800) set => link resolved;
+; bits 14:15 => speed (10=1000M). That one photo tells the whole TX story.
 VGATXT equ 0x00020000
 ar_hud:
+    cmp byte [ar_present], 0
+    jne .go
+    ret                              ; NIC absent: no live registers to show
+.go:
+    ; ----- row 47: PHY / link diagnostics -----
+    mov edi, VGATXT + 47 * 160
+    mov al, 'P'
+    call ar_pc
+    mov bl, MII_PSSR
+    call ar_mdio_read
+    mov cl, 4
+    call ar_hex
+    mov al, ' '
+    call ar_pc
+    mov al, 'L'
+    call ar_pc
+    mov bl, MII_BMSR
+    call ar_mdio_read                ; BMSR is latched; read twice for live link bit
+    mov bl, MII_BMSR
+    call ar_mdio_read
+    mov cl, 4
+    call ar_hex
+    mov al, ' '
+    call ar_pc
+    mov al, 'U'
+    call ar_pc
+    mov eax, [ar_link_up]
+    mov cl, 1
+    call ar_hex
+    mov al, ' '
+    call ar_pc
+    mov al, 'S'
+    call ar_pc
+    mov eax, [ar_speed]
+    mov cl, 4
+    call ar_hex
+    mov al, ' '
+    call ar_pc
+    mov al, 'I'
+    call ar_pc
+    mov ebx, R_IDLE
+    call ar_rd32
+    mov cl, 8
+    call ar_hex
+    mov al, ' '
+    call ar_pc
+    mov al, 'D'
+    call ar_pc
+    mov ebx, R_DMACTRL
+    call ar_rd32
+    mov cl, 8
+    call ar_hex
+    ; ----- row 48: MAC / ring diagnostics -----
     mov edi, VGATXT + 48 * 160
     mov al, 'M'
     call ar_pc
@@ -470,12 +706,14 @@ ar_hex:                              ; EAX value, CL = digit count, EDI = text p
     ret
 
 ar_mmio    dd 0
+ar_present db 0
 ar_macraw  times 8 db 0
-ar_macctrl dd 0
-ar_dmactrl dd 0
-ar_txqcfg  dd 0
-ar_rxqcfg  dd 0
 ar_txlen   dd 0
+ar_pssr    dw 0
+ar_idle    dd 0
+ar_link_up dd 0
+ar_speed   dd 0
+ar_duplex  db 0
 ar_tpd_prod dw 0
 ar_rrd_clean dw 0
 ar_rfd_prod dw 0
