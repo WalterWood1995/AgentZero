@@ -77,7 +77,7 @@ def _schedule(period, frames):
     return [int(round(i * period / frames)) % period for i in range(frames)]
 
 
-def run(image, ip="127.0.0.1", n_epi=64, frames=64, enter=True,
+def run(image, ip="127.0.0.1", n_epi=96, frames=256, enter=True,
         passes=1, delay=0.0004, render_dir=None, verbose=True):
     """Load the epicycles, then animate: each frame the OLD PC computes the chain
     (E), the dev PC renders and blits it. render_dir => also save frame PNGs."""

@@ -39,7 +39,7 @@ SCR_ROWS equ 50                    ; 80x50 text mode (small 8x8 font, fine detai
 SCR_CELLS equ 80 * SCR_ROWS
 RAIN_FRAMES equ 170                ; how many animation frames the intro runs
 FRAME_COUNTS equ 29800             ; PIT ch0 counts per frame (~25 ms, CPU-independent)
-STAGE2_SECTORS equ 32              ; must match stage1.asm / pxe_stage1.asm (sector budget)
+STAGE2_SECTORS equ 34              ; must match stage1.asm / pxe_stage1.asm (sector budget)
 ; --- Fourier "epicycle" compute (the old PC's CPU does the real fixed-point maths) ---
 ; The Agent preloads, into free high RAM (not part of the kernel image), a small
 ; coefficient block and a sine lookup table; the kernel's E command then evaluates
@@ -49,7 +49,8 @@ SIN_BASE  equ 0x00120000           ; sine table: SINLEN int32 entries, Q14, [0,2
 SIN_SHIFT equ 14                    ; sine table fixed-point scale = 1<<14
 SIN_MASK  equ 1023                  ; table length 1024 (power of two -> mod via AND)
 SIN_QUARTER equ 256                 ; +quarter turn = cosine
-EPI_MAX   equ 96                    ; max epicycles (bounds the reply packet)
+EPI_MAX   equ 300                   ; max epicycles (301 pts x 4 = 1204B reply, < MTU;
+                                    ; needs tx_buf >= 1204 and the 34-sector budget)
 
 ; ================= 16-bit real mode: set up and switch =================
 stage2:
@@ -1017,7 +1018,7 @@ net_loop:
 emit16:
     push ebx
     movzx ebx, word [tx_len]
-    cmp bx, 500
+    cmp bx, 1280                     ; cap < tx_buf (1536); 301 pts x4 = 1204B fits, < MTU
     jae .full
     mov [tx_buf + ebx], ax
     add word [tx_len], 2
@@ -1331,7 +1332,7 @@ out_putc:
     push eax
     push ebx
     movzx ebx, word [tx_len]
-    cmp bx, 500
+    cmp bx, 1280                     ; cap < tx_buf (1536); 301 pts x4 = 1204B fits, < MTU
     jae .full
     mov [tx_buf + ebx], al
     inc word [tx_len]
@@ -2797,7 +2798,7 @@ tx_len    dw 0
 align 4
 blk_row   dd 0                     ; current row for B (block) writes
 rx_buf    times 1536 db 0          ; received command packet (fits a full 1472-byte UDP read)
-tx_buf    times 512 db 0           ; reply payload
+tx_buf    times 1536 db 0          ; reply payload (fits a 301-point Fourier reply, 1204B)
 kbd_len   dd 0
 kbd_buf   times 128 db 0           ; typed line (the user's question)
 shift_state db 0                   ; 1 while a Shift key is held
