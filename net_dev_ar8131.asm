@@ -36,6 +36,8 @@ R_TPD_PIDX equ 0x15F2            ; 16-bit TPD producer index
 R_TPD_CIDX equ 0x15F6            ; 16-bit TPD consumer index
 R_IMR     equ 0x1604
 R_ISR     equ 0x1600
+R_DMACTRL equ 0x15C0
+R_MASTER_SOFT_RST equ 0x1
 
 dev_init:
     call ar_pci_find                 ; 1969:1026 -> ar_mmio, enable bus master
@@ -52,6 +54,70 @@ dev_init:
     mov eax, [ar_macraw]
     bswap eax                        ; eax = mac2 mac3 mac4 mac5 (now in byte order)
     mov [nn_mac + 2], eax            ; stores mac2..mac5
+    ; ---- capture PXE's working config BEFORE reset (so we reuse its magic values) ----
+    mov ebx, R_DMACTRL
+    call ar_rd32
+    mov [ar_dmactrl], eax
+    mov ebx, R_TXQ
+    call ar_rd32
+    mov [ar_txqcfg], eax
+    mov ebx, R_RXQ
+    call ar_rd32
+    mov [ar_rxqcfg], eax
+    mov ebx, R_MACCTRL
+    call ar_rd32
+    mov [ar_macctrl], eax            ; keep PXE's speed/duplex bits
+    ; ---- stop the engines ----
+    mov eax, [ar_txqcfg]
+    and eax, ~0x20
+    mov ebx, R_TXQ
+    call ar_wr32
+    mov eax, [ar_rxqcfg]
+    and eax, ~0x80000000
+    mov ebx, R_RXQ
+    call ar_wr32
+    mov eax, [ar_macctrl]
+    and eax, ~0x3
+    mov ebx, R_MACCTRL
+    call ar_wr32
+    mov ecx, 0x00400000
+.s0: dec ecx
+    jnz .s0
+%ifdef AR_RESET
+    ; ---- soft reset MAC + DMA (OFF by default: it drops the PHY link and we don't
+    ; re-init the PHY; minimal-takeover keeps PXE's live link/PHY/DMA instead) ----
+    mov ebx, R_MASTER
+    call ar_rd32
+    mov edx, eax
+    or  eax, 0x1                     ; MASTER_CTRL_SOFT_RST
+    call ar_wr32
+    mov ecx, 0x02000000
+.s1: dec ecx
+    jnz .s1
+    mov eax, edx
+    mov ebx, R_MASTER
+    call ar_wr32
+    mov ecx, 0x02000000
+.s2: dec ecx
+    jnz .s2
+    mov eax, [ar_dmactrl]            ; restore DMA config after reset
+    mov ebx, R_DMACTRL
+    call ar_wr32
+    movzx eax, byte [nn_mac + 2]     ; re-write MAC (reset cleared it)
+    shl eax, 8
+    mov al, [nn_mac + 3]
+    shl eax, 8
+    mov al, [nn_mac + 4]
+    shl eax, 8
+    mov al, [nn_mac + 5]
+    mov ebx, R_MACADDR
+    call ar_wr32
+    movzx eax, byte [nn_mac + 0]
+    shl eax, 8
+    mov al, [nn_mac + 1]
+    mov ebx, R_MACADDR + 4
+    call ar_wr32
+%endif
     ; ---- disable interrupts ----
     mov ebx, R_IMR
     xor eax, eax
@@ -59,23 +125,6 @@ dev_init:
     mov ebx, R_ISR
     mov eax, 0xFFFFFFFF
     call ar_wr32
-    ; ---- stop TXQ / RXQ / MAC to reconfigure rings ----
-    mov ebx, R_TXQ
-    call ar_rd32
-    and eax, ~0x20                   ; TXQ_CTRL_EN
-    call ar_wr32
-    mov ebx, R_RXQ
-    call ar_rd32
-    and eax, ~0x80000000             ; RXQ_CTRL_EN
-    call ar_wr32
-    mov ebx, R_MACCTRL
-    call ar_rd32
-    mov [ar_macctrl], eax            ; keep PXE's speed/duplex bits
-    and eax, ~0x3                    ; clear TX_EN|RX_EN
-    call ar_wr32
-    mov ecx, 0x00200000              ; brief settle
-.s: dec ecx
-    jnz .s
     ; ---- program our rings ----
     mov ebx, R_TXBASEHI
     xor eax, eax
@@ -122,19 +171,22 @@ dev_init:
     mov ebx, R_LOADPTR
     mov eax, 1
     call ar_wr32
-    ; ---- re-enable queues + MAC ----
+    ; ---- re-enable queues + MAC with the PROPER atl1c config (PXE's TXQ/RXQ regs
+    ; read 0 / C0000000 because UNDI doesn't use the atl1c ring engine - restoring
+    ; those left TX unconfigured, which is why the TX consumer never advanced) ----
+    mov eax, 0x020000F5             ; L1C_TXQ_CFGV (0x020000D5) | TXQ_CTRL_EN (0x20)
     mov ebx, R_TXQ
-    call ar_rd32
-    or  eax, 0x20
     call ar_wr32
+    mov eax, 0x80800000             ; RXQ_CTRL_EN (0x80000000) | rfd_burst 8<<20
     mov ebx, R_RXQ
-    call ar_rd32
-    or  eax, 0x80000000
     call ar_wr32
     mov eax, [ar_macctrl]
     or  eax, 0x3 | 0x40 | 0x80 | 0x4000000   ; TX_EN|RX_EN|ADD_CRC|PAD|BC_EN
     mov ebx, R_MACCTRL
     call ar_wr32
+    mov ecx, 0x02000000              ; let the link/MAC settle after reset
+.s3: dec ecx
+    jnz .s3
     ; ---- hand all RX buffers to the NIC ----
     mov ebx, R_RFD_PIDX
     mov eax, AR_CNT - 1
@@ -372,6 +424,22 @@ ar_hud:
     mov eax, [AR_RRD + 12]
     mov cl, 8
     call ar_hex
+    mov al, ' '
+    call ar_pc
+    mov al, 'Q'
+    call ar_pc
+    mov ebx, R_TXQ                    ; live TXQ_CTRL (bit5 = enabled?)
+    call ar_rd32
+    mov cl, 8
+    call ar_hex
+    mov al, ' '
+    call ar_pc
+    mov al, 'B'
+    call ar_pc
+    mov ebx, R_TPD_LO                ; TPD ring base readback (did it latch to AR_TPD?)
+    call ar_rd32
+    mov cl, 8
+    call ar_hex
     ret
 ar_pc:                               ; AL = char -> text cell at EDI, green, EDI+=2
     mov [edi], al
@@ -404,6 +472,9 @@ ar_hex:                              ; EAX value, CL = digit count, EDI = text p
 ar_mmio    dd 0
 ar_macraw  times 8 db 0
 ar_macctrl dd 0
+ar_dmactrl dd 0
+ar_txqcfg  dd 0
+ar_rxqcfg  dd 0
 ar_txlen   dd 0
 ar_tpd_prod dw 0
 ar_rrd_clean dw 0
