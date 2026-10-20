@@ -42,7 +42,7 @@ FRAME_COUNTS equ 29800             ; PIT ch0 counts per frame (~25 ms, CPU-indep
 %ifdef NIC_NATIVE
 STAGE2_SECTORS equ 40              ; native build is larger (e1000 driver + IP/UDP)
 %else
-STAGE2_SECTORS equ 34              ; must match stage1.asm / pxe_stage1.asm (sector budget)
+STAGE2_SECTORS equ 35              ; must match stage1.asm / pxe_stage1.asm (sector budget)
 %endif
 ; --- Fourier "epicycle" compute (the old PC's CPU does the real fixed-point maths) ---
 ; The Agent preloads, into free high RAM (not part of the kernel image), a small
@@ -637,6 +637,8 @@ exec_line:
     je  do_write
     cmp al, 'A'
     je  do_alu
+    cmp al, 'J'
+    je  do_rd32
     cmp al, '?'
     je  do_help
     mov esi, s_unknown
@@ -1125,6 +1127,16 @@ do_cpuid0:
 do_cpuid1:
     mov eax, 1
     cpuid
+    call print_hex32
+    call nl
+    jmp exec_done
+
+; ---- J<8hex addr>: 32-bit read of [addr] (proper dword/MMIO read, unlike M's bytes) ----
+do_rd32:
+    mov dword [parse_ptr], line_buf + 1
+    mov bl, 8
+    call phex                      ; EAX = address
+    mov eax, [eax]                 ; aligned 32-bit read (works for device MMIO registers)
     call print_hex32
     call nl
     jmp exec_done

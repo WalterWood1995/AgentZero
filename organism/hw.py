@@ -233,6 +233,15 @@ class HW:
         b = self.mem(addr, 4)
         return int.from_bytes(b, "little") if b and len(b) == 4 else None
 
+    def rd32(self, addr):
+        """Proper aligned 32-bit read of [addr] (J command). Unlike mem(), this reads
+        device MMIO registers correctly (M's byte reads give a replicated low byte)."""
+        r = self.result("J%08X" % (addr & 0xFFFFFFFF))
+        try:
+            return int(r, 16) if r else None
+        except ValueError:
+            return None
+
     # ---- autonomy: screenshot (read the old PC's framebuffer) + reboot ----
     def geom(self):
         """Query the graphics framebuffer geometry (Q command) -> (w,h,pitch,bpp)."""
