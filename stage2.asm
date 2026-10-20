@@ -739,6 +739,8 @@ net_loop:
     je  .do_fbread
     cmp byte [rx_buf], 'K'         ; K! = reboot (8042 CPU reset) -> re-PXE-boots
     je  .do_reboot
+    cmp byte [rx_buf], 'N'         ; N<text> = inject keystrokes (type; \r = Enter)
+    je  .do_keys
     ; copy rx_buf -> line_buf up to CR/LF/limit (single-line commands)
     xor esi, esi
 .cp:
@@ -951,6 +953,18 @@ net_loop:
     out 0x64, al                   ; 8042: assert INIT -> machine resets, re-PXE-boots
     cli
     hlt
+.do_keys:                          ; N<text> -> feed each byte to kbd_char (as if typed)
+    dec ecx                        ; drop the 'N'; ECX = text length
+    jle .keys_done
+    mov esi, rx_buf + 1
+.keys_loop:
+    mov al, [esi]
+    inc esi
+    call kbd_char                  ; echoes / line-buffers; CR(13) fires Enter -> send
+    dec ecx
+    jnz .keys_loop
+.keys_done:
+    jmp .poll
 .do_qgeo:                          ; Q: reply 4 LE dwords w,h,pitch,bpp
     mov eax, [lfb_w]
     mov [tx_buf+0], eax

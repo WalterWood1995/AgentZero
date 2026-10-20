@@ -289,6 +289,19 @@ class HW:
                 pass
             time.sleep(0.03)
 
+    def type_keys(self, text, enter=True):
+        """Inject keystrokes into the old PC as if typed on its keyboard (N command):
+        each byte is fed to the kernel's key handler, so it echoes on the input line and
+        a trailing CR presses Enter. Sent once (re-typing on retry would duplicate the
+        text) - verify with screenshot() and resend if the packet was dropped."""
+        payload = b"N" + (text.encode() if isinstance(text, str) else text)
+        if enter:
+            payload += b"\r"
+        try:
+            self.s.sendto(payload, (self.ip, self.port))
+        except OSError:
+            pass
+
     def mmio_lowbyte(self, addr):
         """Read back an MMIO register's low byte. The `mem` reader returns each
         device register's low byte replicated across the 4 lanes, so only the low
