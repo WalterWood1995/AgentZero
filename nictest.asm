@@ -57,6 +57,7 @@ pm_entry:
     jmp .loop
 
 %include "net_native.asm"
+%include "net_dev_e1000.asm"
 
 ; ---- host-provided buffers the driver writes into ----
 rx_buf    times 2048 db 0

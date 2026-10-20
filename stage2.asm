@@ -670,6 +670,10 @@ net_loop:
 %endif
     mov dword [kbd_len], 0
 .poll:
+%ifdef NIC_AR8131
+    call ar_hud                    ; live NIC diagnostics on the bottom text row
+    mov byte [need_present], 1
+%endif
     ; drain the PS/2 keyboard fully this iteration (no overflow/beep on fast
     ; typing); each mapped key echoes, Enter sends the line over UDP
     call kbd_service
@@ -2933,7 +2937,12 @@ vbe_modeinfo  times 256 db 0        ; VBE mode info block (AX=4F01)
 
 %ifdef NIC_NATIVE
 BITS 32
-%include "net_native.asm"           ; native e1000 driver + minimal ARP/IP/UDP (fast path)
+%include "net_native.asm"           ; device-agnostic ARP/IP/UDP stack (fast path)
+%ifdef NIC_AR8131
+%include "net_dev_ar8131.asm"       ; real metal: Atheros AR8131 (old Asus)
+%else
+%include "net_dev_e1000.asm"        ; QEMU: Intel e1000
+%endif
 %endif
 %include "face_data.inc"            ; Dario portrait baked into the kernel
 
