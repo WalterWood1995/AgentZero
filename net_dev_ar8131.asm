@@ -52,11 +52,22 @@ R_TPD_CIDX equ 0x15F6            ; 16-bit prio0 TPD consumer index
 R_IMR     equ 0x1604
 R_ISR     equ 0x1600
 R_DMACTRL equ 0x15C0
+; PCIe / clock / power registers (reset_pcie path - critical: OOB engine + ASPM +
+; clock-gating otherwise silently drop queue/DMA register writes)
+R_WOL     equ 0x14A0            ; WOL_CTRL
+R_LTSSM   equ 0x12FC            ; LTSSM_ID_CTRL (clear LTSSM_ID_EN_WRO 0x1000)
+R_PHYMISC equ 0x1000            ; PCIE_PHYMISC (set FORCE_RCV_DET 0x4 for l1c)
+R_PMCTRL  equ 0x12F8            ; PM_CTRL (clear ASPM L0s/L1 or DMA wedges)
+R_CLKGATE equ 0x1814            ; CLK_GATING_CTRL (= 0 during bring-up)
+R_MTU     equ 0x149C            ; MTU (>= frame + 22 or frames are dropped)
+R_SERDES  equ 0x1424
 
 ; MASTER_CTRL bits
 MASTER_SOFT_RST equ 0x1
 MASTER_OOB_DIS  equ 0x40
 MASTER_SA_TIMER equ 0x80
+MASTER_CLK_SEL_DIS equ 0x1000
+MAC_SPEED_MODE_SW  equ 0x40000000   ; MAC_CTRL bit30: driver drives speed
 
 ; MDIO_CTRL bits (clause 22, internal PHY, clk 25/4 = 0)
 MDIO_SPRES   equ 0x00400000      ; BIT(22) suppress preamble
@@ -108,6 +119,8 @@ dev_init:
     mov eax, [ar_macraw]
     bswap eax                        ; eax = mac2 mac3 mac4 mac5 (now in byte order)
     mov [nn_mac + 2], eax            ; stores mac2..mac5
+%ifndef AR_NORESET
+    call ar_reset_pcie               ; kill WoL/LTSSM/ASPM/clk-sel - MUST precede reset
     ; ---- stop the engines (so the soft reset is clean) ----
     mov ebx, R_TXQ
     call ar_rd32
@@ -127,15 +140,19 @@ dev_init:
     mov ecx, 0x00400000
 .s0: dec ecx
     jnz .s0
-%ifndef AR_NORESET
-    ; ---- soft reset MAC + DMA, then wait for all engines idle ----
-    mov eax, MASTER_OOB_DIS | MASTER_SOFT_RST
+    ; ---- soft reset MAC+DMA (RMW: OOB_DIS is load-bearing - the out-of-box engine
+    ; owns the MAC block and drops queue/DMA writes until OOB_DIS+SOFT_RST) ----
+    mov ebx, R_MASTER
+    call ar_rd32
+    or  eax, MASTER_OOB_DIS | MASTER_SOFT_RST
     mov ebx, R_MASTER
     call ar_wr32
-    mov ecx, 0x00800000              ; settle
+    mov ebx, R_MASTER                ; posted-write flush
+    call ar_rd32
+    mov ecx, 0x02000000              ; ~10ms+ settle
 .s1: dec ecx
     jnz .s1
-    mov esi, 200000                  ; poll IDLE_STATUS until TXQ/RXQ/TXMAC/RXMAC idle
+    mov esi, 200000                  ; poll IDLE_STATUS until all engines idle
 .iw:
     mov ebx, R_IDLE
     call ar_rd32
@@ -145,15 +162,30 @@ dev_init:
     dec esi
     jnz .iw
 .idle_ok:
-    mov eax, MASTER_OOB_DIS | MASTER_SA_TIMER   ; clear SOFT_RST
+    mov ebx, R_MASTER                ; drop SOFT_RST, keep OOB_DIS
+    call ar_rd32
+    and eax, ~MASTER_SOFT_RST
+    or  eax, MASTER_OOB_DIS | MASTER_SA_TIMER
     mov ebx, R_MASTER
     call ar_wr32
+    mov ebx, R_MACCTRL               ; software drives speed/duplex
+    call ar_rd32
+    or  eax, MAC_SPEED_MODE_SW
+    mov ebx, R_MACCTRL
+    call ar_wr32
+    xor eax, eax                     ; CLK_GATING_CTRL = 0 (gated clock also drops writes)
+    mov ebx, R_CLKGATE
+    call ar_wr32
 %endif
-%ifndef AR_NOPHY
+%ifdef AR_PHYRESET
+    ; opt-in only: resetting the PHY drops PXE's live link and needs full re-autoneg.
+    ; Default keeps PXE's already-up gigabit link (the MAC soft reset does not reset
+    ; the PHY), so we only read its status below.
     call ar_phy_reset                ; take the PHY out of power-down + ext reset
     call ar_phy_autoneg              ; advertise 10/100/1000, restart autoneg
 %endif
     call ar_link_wait                ; poll MII_GIGA_PSSR -> ar_link_up/ar_speed/ar_duplex
+%ifndef AR_NORESET
     ; ---- re-write MAC address (soft reset cleared the station address) ----
     movzx eax, byte [nn_mac + 2]
     shl eax, 8
@@ -169,6 +201,7 @@ dev_init:
     mov al, [nn_mac + 1]
     mov ebx, R_MACADDR + 4
     call ar_wr32
+%endif
     ; ---- disable interrupts ----
     mov ebx, R_IMR
     xor eax, eax
@@ -218,8 +251,12 @@ dev_init:
     inc ecx
     cmp ecx, AR_CNT
     jb  .rfill
-    ; ---- DMA config (PXE's known-good value for this chip) ----
-    mov eax, 0x00647C24
+    ; ---- MTU (>= max frame + 22, else the MAC drops the frame before completion) ----
+    mov eax, 0x000005F2
+    mov ebx, R_MTU
+    call ar_wr32
+    ; ---- DMA config (atl1c mainline value; our old 0x00647C24 had 2 spurious bits) ----
+    mov eax, 0x00047C24
     mov ebx, R_DMACTRL
     call ar_wr32
     ; ---- latch ring base/size ----
@@ -234,21 +271,29 @@ dev_init:
     mov ebx, R_RXQ
     call ar_wr32
     ; ---- MAC_CTRL: TX/RX enable + CRC/PAD/BC + resolved speed/duplex ----
+%ifdef AR_NORESET
+    ; minimal takeover: preserve PXE's live speed/duplex, only ensure TX/RX on
+    mov ebx, R_MACCTRL
+    call ar_rd32
+    or  eax, 0x3 | 0x40 | 0x80 | 0x4000000    ; TX_EN|RX_EN|ADD_CRC|PAD|BC_EN
+    mov ebx, R_MACCTRL
+    call ar_wr32
+%else
     mov eax, 0x3 | 0x40 | 0x80 | 0x4000000   ; TX_EN|RX_EN|ADD_CRC|PAD|BC_EN
     or  eax, (7 << 10)                        ; preamble length 7
-    cmp dword [ar_speed], 1000
-    jne .sp10100
-    or  eax, (2 << 20)                        ; MAC_CTRL_SPEED_1000
+    or  eax, 0x20                             ; full duplex (gigabit link is always full)
+    cmp dword [ar_speed], 100                 ; speed: default gigabit unless 10/100
+    je  .sp10100
+    cmp dword [ar_speed], 10
+    je  .sp10100
+    or  eax, (2 << 20)                        ; MAC_CTRL_SPEED_1000 (also the default)
     jmp .spdone
 .sp10100:
     or  eax, (1 << 20)                        ; MAC_CTRL_SPEED_10_100
 .spdone:
-    cmp byte [ar_duplex], 0
-    je  .hd
-    or  eax, 0x20                             ; MAC_CTRL_DUPLX (full)
-.hd:
     mov ebx, R_MACCTRL
     call ar_wr32
+%endif
     mov ecx, 0x02000000              ; let the MAC settle
 .s3: dec ecx
     jnz .s3
@@ -259,6 +304,39 @@ dev_init:
     mov word [ar_tpd_prod], 0
     mov word [ar_rrd_clean], 0
     mov word [ar_rfd_prod], AR_CNT - 1
+    ret
+
+; ---- reset_pcie: WoL/LTSSM/clk-sel + DISABLE ASPM (L0s/L1) before the MAC reset.
+; ASPM or clock-sel left active lets the PCIe link nap and wedges DMA, so the queue
+; engine never runs and queue-register writes read back 0. Mirrors atl1c_reset_pcie
+; for the athr_l1c (AR8131) path. ----
+ar_reset_pcie:
+    xor eax, eax                     ; WOL_CTRL = 0
+    mov ebx, R_WOL
+    call ar_wr32
+    mov ebx, R_LTSSM                 ; LTSSM_ID_CTRL &= ~0x1000 (LTSSM_ID_EN_WRO off)
+    call ar_rd32
+    and eax, ~0x1000
+    mov ebx, R_LTSSM
+    call ar_wr32
+    mov ebx, R_MASTER                ; MASTER_CTRL &= ~CLK_SEL_DIS (let pclk drop to 25M)
+    call ar_rd32
+    and eax, ~MASTER_CLK_SEL_DIS
+    mov ebx, R_MASTER
+    call ar_wr32
+    mov ebx, R_PHYMISC               ; PCIE_PHYMISC |= FORCE_RCV_DET (0x4), l1c path
+    call ar_rd32
+    or  eax, 0x4
+    mov ebx, R_PHYMISC
+    call ar_wr32
+    mov ebx, R_PMCTRL                ; PM_CTRL: clear ASPM L0s (0x1000) + L1 (0x8)
+    call ar_rd32
+    and eax, ~(0x8 | 0x1000)
+    mov ebx, R_PMCTRL
+    call ar_wr32
+    mov ecx, 0x01000000              ; ~5ms settle
+.d: dec ecx
+    jnz .d
     ret
 
 ; ---- PHY: take it out of power-down and pulse the external (DSP) reset ----
@@ -300,7 +378,7 @@ ar_link_wait:
     mov dword [ar_link_up], 0
     mov dword [ar_speed], 0
     mov byte [ar_duplex], 0
-    mov esi, 1500                    ; ~1500 polls * ~2ms ~= 3s
+    mov esi, 3000                    ; ~3000 polls * ~2ms ~= 6s (link may re-resolve after MAC reset)
 .lw:
     mov bl, MII_PSSR
     call ar_mdio_read                ; -> AX = PSSR
@@ -615,6 +693,22 @@ ar_hud:
     mov al, 'D'
     call ar_pc
     mov ebx, R_DMACTRL
+    call ar_rd32
+    mov cl, 8
+    call ar_hex
+    mov al, ' '
+    call ar_pc
+    mov al, 'X'                       ; live MASTER_CTRL
+    call ar_pc
+    mov ebx, R_MASTER
+    call ar_rd32
+    mov cl, 8
+    call ar_hex
+    mov al, ' '
+    call ar_pc
+    mov al, 'G'                       ; live CLK_GATING_CTRL (should read 0)
+    call ar_pc
+    mov ebx, R_CLKGATE
     call ar_rd32
     mov cl, 8
     call ar_hex
