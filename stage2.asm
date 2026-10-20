@@ -735,6 +735,10 @@ net_loop:
     je  .do_load
     cmp byte [rx_buf], 'E'         ; E = evaluate the Fourier epicycle chain at a time step
     je  .do_epi
+    cmp byte [rx_buf], 'Y'         ; Y<8hex off><4hex len> = read framebuffer (screenshot)
+    je  .do_fbread
+    cmp byte [rx_buf], 'K'         ; K! = reboot (8042 CPU reset) -> re-PXE-boots
+    je  .do_reboot
     ; copy rx_buf -> line_buf up to CR/LF/limit (single-line commands)
     xor esi, esi
 .cp:
@@ -911,6 +915,42 @@ net_loop:
     jz  .poll
     rep stosd                      ; write ECX copies of EAX at [EDI]
     jmp .zrun
+.do_fbread:                        ; Y<8hex off><4hex len> -> reply len framebuffer bytes
+    mov dword [parse_ptr], rx_buf + 1
+    mov bl, 8
+    call phex                      ; EAX = byte offset into the framebuffer
+    mov esi, eax
+    mov bl, 4
+    call phex                      ; EAX = length (<= ~1400)
+    mov ecx, eax
+    cmp ecx, 1400
+    jbe .fr_lenok
+    mov ecx, 1400
+.fr_lenok:
+    mov edx, [fb_size]             ; clamp off+len to the framebuffer
+    cmp esi, edx
+    jb  .fr_inrange
+    xor ecx, ecx                   ; offset past end -> empty reply
+    jmp .fr_copy
+.fr_inrange:
+    mov eax, edx
+    sub eax, esi                   ; bytes left
+    cmp ecx, eax
+    jbe .fr_copy
+    mov ecx, eax
+.fr_copy:
+    mov [tx_len], cx
+    mov edi, tx_buf
+    add esi, [lfb_phys]            ; source = lfb_phys + offset
+    rep movsb
+    jmp .reply
+.do_reboot:                        ; K! -> pulse the 8042 reset line (CPU reset)
+    cmp byte [rx_buf+1], '!'
+    jne .poll
+    mov al, 0xFE
+    out 0x64, al                   ; 8042: assert INIT -> machine resets, re-PXE-boots
+    cli
+    hlt
 .do_qgeo:                          ; Q: reply 4 LE dwords w,h,pitch,bpp
     mov eax, [lfb_w]
     mov [tx_buf+0], eax

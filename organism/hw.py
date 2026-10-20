@@ -233,6 +233,62 @@ class HW:
         b = self.mem(addr, 4)
         return int.from_bytes(b, "little") if b and len(b) == 4 else None
 
+    # ---- autonomy: screenshot (read the old PC's framebuffer) + reboot ----
+    def geom(self):
+        """Query the graphics framebuffer geometry (Q command) -> (w,h,pitch,bpp)."""
+        r = self._raw(b"Q")
+        if not r or len(r) < 16:
+            return None
+        import struct
+        return struct.unpack("<IIII", r[:16])
+
+    def fb_read(self, off, length):
+        """Read `length` (<=1400) bytes of the framebuffer at byte `off` (Y command)."""
+        r = self._raw(("Y%08X%04X" % (off, length & 0xFFFF)).encode())
+        return r if r else b""
+
+    def screenshot(self, path=None, w=None, h=None, pitch=None, y0=0, y1=None, chunk=1400):
+        """Read the old PC's VBE framebuffer back over UDP and save it as a PNG.
+        y0..y1 limit the rows (for a fast partial grab, e.g. a status bar)."""
+        from PIL import Image
+        import numpy as np
+        g = self.geom()
+        if g and not (w and h and pitch):
+            w, h, pitch, _ = g
+        w = w or 1024; h = h or 768; pitch = pitch or w * 4
+        if y1 is None:
+            y1 = h
+        rows = []
+        for y in range(y0, y1):
+            base = y * pitch
+            line = bytearray()
+            x = 0
+            while x < w * 4:
+                n = min(chunk, w * 4 - x)
+                d = self.fb_read(base + x, n)
+                if not d:
+                    d = b"\x00" * n          # ride out a dropped reply
+                line += d[:n]
+                x += n
+            rows.append(bytes(line[:w * 4]))
+        buf = b"".join(rows)
+        arr = np.frombuffer(buf, np.uint8).reshape(len(rows), w, 4)
+        rgb = arr[:, :, [2, 1, 0]]           # BGRX -> RGB
+        img = Image.fromarray(rgb, "RGB")
+        if path:
+            img.save(path)
+        return img
+
+    def reboot(self):
+        """Reboot the old PC (K! = 8042 CPU reset); it re-PXE-boots the latest image.
+        Fire-and-forget: the machine resets before any reply."""
+        for _ in range(4):
+            try:
+                self.s.sendto(b"K!", (self.ip, self.port))
+            except OSError:
+                pass
+            time.sleep(0.03)
+
     def mmio_lowbyte(self, addr):
         """Read back an MMIO register's low byte. The `mem` reader returns each
         device register's low byte replicated across the 4 lanes, so only the low
