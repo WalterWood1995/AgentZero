@@ -39,7 +39,11 @@ SCR_ROWS equ 50                    ; 80x50 text mode (small 8x8 font, fine detai
 SCR_CELLS equ 80 * SCR_ROWS
 RAIN_FRAMES equ 170                ; how many animation frames the intro runs
 FRAME_COUNTS equ 29800             ; PIT ch0 counts per frame (~25 ms, CPU-independent)
+%ifdef NIC_NATIVE
+STAGE2_SECTORS equ 40              ; native build is larger (e1000 driver + IP/UDP)
+%else
 STAGE2_SECTORS equ 34              ; must match stage1.asm / pxe_stage1.asm (sector budget)
+%endif
 ; --- Fourier "epicycle" compute (the old PC's CPU does the real fixed-point maths) ---
 ; The Agent preloads, into free high RAM (not part of the kernel image), a small
 ; coefficient block and a sine lookup table; the kernel's E command then evaluates
@@ -551,6 +555,11 @@ pm_entry:
     add eax, ecx
     mov edx, [eax+16]
     mov [our_ip], edx
+%ifdef NIC_NATIVE
+    mov eax, [our_ip]              ; take over the NIC with the native e1000 driver
+    mov [nn_ip], eax              ; (PXE was used only to learn our DHCP IP)
+    call nn_init
+%else
     ; UDP_OPEN (0x0030) bound to our IP
     mov edi, pxe_param
     xor eax, eax
@@ -560,6 +569,7 @@ pm_entry:
     mov [pxe_param+2], eax
     mov ax, 0x0030
     call pxe_call
+%endif
 .no_pxe:
     cmp byte [vbe_ok], 0           ; set up the graphics text console geometry
     je  .no_fb
@@ -670,6 +680,14 @@ net_loop:
 .nopres:
     ; Always tight-poll UDP_READ (no delay). On real hardware a polling gap drops
     ; incoming packets, so the Agent's bursts need continuous reading.
+%ifdef NIC_NATIVE
+    call nn_poll_cmd               ; native e1000: poll RX, answer ARP, deliver one UDP
+    test ax, ax                    ; AX=0 -> rx_buf has a command, ECX=len, peer_* set
+    jnz .poll
+    cmp ecx, RX_MAX
+    jbe .lenok
+    mov ecx, RX_MAX
+%else
     ; UDP_READ
     mov edi, pxe_param
     xor eax, eax
@@ -694,6 +712,7 @@ net_loop:
     cmp ecx, RX_MAX
     jbe .lenok
     mov ecx, RX_MAX
+%endif
 .lenok:
     mov byte [rx_buf+ecx], 0       ; null-terminate the raw packet
     cmp byte [rx_buf], 'G'         ; G = blit raw pixels into the VBE framebuffer
@@ -991,6 +1010,10 @@ net_loop:
 .epi_done:
     jmp .reply
 .reply:
+%ifdef NIC_NATIVE
+    call nn_reply                  ; native e1000: wrap tx_buf in UDP + DMA transmit
+    jmp .poll
+%else
     ; UDP_WRITE the reply back to the sender
     mov edi, pxe_param
     xor eax, eax
@@ -1012,6 +1035,7 @@ net_loop:
     mov ax, 0x0033                 ; PXENV_UDP_WRITE
     call pxe_call
     jmp .poll
+%endif
 
 ; emit16: append AX (low 16 bits of EAX) to tx_buf as a little-endian int16.
 ; Standalone (non-local) so it does not disturb net_loop's local-label scope.
@@ -2907,6 +2931,10 @@ align 2
 vbe_info      times 512 db 0        ; VBE controller info block (AX=4F00)
 vbe_modeinfo  times 256 db 0        ; VBE mode info block (AX=4F01)
 
+%ifdef NIC_NATIVE
+BITS 32
+%include "net_native.asm"           ; native e1000 driver + minimal ARP/IP/UDP (fast path)
+%endif
 %include "face_data.inc"            ; Dario portrait baked into the kernel
 
     times (STAGE2_SECTORS*512)-($-$$) db 0
