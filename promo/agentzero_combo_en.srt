@@ -1,119 +1,55 @@
 1
-00:00:10,200 --> 00:00:15,500
-Chapter one. A 2009 Asus K50IJ whose disk controller hangs every Linux at boot. It now has no operating system.
+00:00:07,700 --> 00:00:12,500
+A 2009 Asus K50IJ whose disk controller hangs every Linux at boot. It now has no operating system.
 
 2
-00:00:15,500 --> 00:00:21,000
+00:00:12,500 --> 00:00:17,500
 At boot it pulls a 41 KB bare-metal kernel, written from scratch, over the network. Then the cable comes out, and it keeps living.
 
 3
-00:00:21,000 --> 00:00:27,000
+00:00:17,500 --> 00:00:23,000
 Left: a worm in a petri dish. Right: its brain - 302 neurons, 10,193 synapses, from the public OpenWorm connectome.
 
 4
-00:00:27,000 --> 00:00:33,000
+00:00:23,000 --> 00:00:29,000
 Press H to poke its head: touch neurons ALM/AVM fire, activity runs along the wires to the command neurons, the motor area turns magenta - it reverses.
 
 5
-00:00:33,000 --> 00:00:39,000
+00:00:29,000 --> 00:00:34,500
 Every line that lights up is a real synapse used in that step. Not an animation: a state the CPU computes 120 times a second.
 
 6
-00:00:39,000 --> 00:00:45,000
+00:00:34,500 --> 00:00:40,000
 Each body segment bends by its own dorsal and ventral muscles; the orange glow is food, and it climbs the concentration gradient.
 
 7
-00:00:45,000 --> 00:00:51,000
+00:00:40,000 --> 00:00:45,500
 All of it runs on this 2009 dual-core CPU: int16 fixed point, SSE2 multiply-add, not one line of OS code.
 
 8
-00:00:51,200 --> 00:00:56,500
-The same kernel in an unattended QEMU run: poke the head, it reverses; poke the tail, it surges -
+00:00:45,500 --> 00:00:48,500
+A qualitative cartoon: the wiring is real, the neuron dynamics are a simplified integrate-and-fire model.
 
 9
-00:00:56,500 --> 00:01:03,000
-- drop food: ASEL/ASER sense the concentration rising and falling, it crawls into the glow, the pharyngeal neurons NSM/MC are driven, it slows down and pumps.
+00:00:51,400 --> 00:00:57,000
+Chapter two. This face is not rendered by the dev PC: the camera only sends grey values, and the old machine's own neural network turns every cell into a character.
 
 10
-00:01:03,000 --> 00:01:09,000
-FWD/BWD in the status line are the live spike counts of the forward and backward motor neurons; every response comes from the same connectome.
+00:00:57,000 --> 00:01:03,000
+A tiny MLP: 9 grey inputs, 32 hidden units, 16 glyphs, int16 fixed point, 1.8 KB of weights; 12,288 cells per frame inferred in ring-0 assembly, 10 frames per second.
 
 11
-00:01:09,000 --> 00:01:15,500
-A qualitative cartoon: the wiring is real, the neuron dynamics are a simplified integrate-and-fire model, with three documented modelling assumptions.
+00:01:03,000 --> 00:01:08,500
+The right panel is the model at work: the probe cell's input, hidden layer, output scores, weight maps and multiply-adds.
 
 12
-00:01:24,200 --> 00:01:28,500
-Chapter two. Now it sees you: the dev PC's camera films a face, every frame becomes a green ASCII portrait, live on the old machine's screen.
+00:01:08,500 --> 00:01:11,000
+Bit-exact against the Python reference, cell for cell.
 
 13
-00:01:28,500 --> 00:01:32,500
-Camera, face tracking and glyph mapping run on the dev PC; one frame is only about 4 KB, six UDP packets - that is why it is real-time.
-
-14
-00:01:32,500 --> 00:01:36,500
-The old machine receives nothing but text cells: the kernel paints each cell from its ROM font into the framebuffer, in three levels - dark green, bright green, white.
-
-15
-00:01:36,500 --> 00:01:40,300
-Send-to-screen median 6 ms, end to end about 0.1 s. 10 fps on the real machine; this clip is the same kernel recorded in QEMU.
-
-16
-00:01:43,700 --> 00:01:52,000
-Chapter three. Left, your face. Right, the worm's 302 neurons - on the same green screen, every brain step computed on the old CPU.
-
-17
-00:01:52,000 --> 00:02:01,000
-Camera motion becomes sensory input: a big move is a head touch, a sudden one a tail touch, leaning in is food getting closer, leaning back is food moving away.
-
-18
-00:02:01,000 --> 00:02:10,000
-Each frame the kernel runs 10 steps and returns 302 membrane potentials and a spike bitmap: dark green resting, bright green near threshold, white firing now.
-
-19
-00:02:10,000 --> 00:02:19,000
-ACTIVITY below is the history of spikes per step; OUT shows the forward and backward motor pools.
-
-20
-00:02:19,000 --> 00:02:30,000
-Every time you move, this connectome really is perturbed - computed on the old machine, not pre-recorded.
-
-21
-00:02:31,700 --> 00:02:40,000
-Now look at the face again: it is not rendered by the dev PC. The old machine's own neural network computes it, cell by cell.
-
-22
-00:02:40,000 --> 00:02:49,000
-A tiny MLP: 9 grey values from a 3x3 neighbourhood in, 32 hidden units, 16 glyphs out. int16 fixed point; the weights are 1.8 KB.
-
-23
-00:02:49,000 --> 00:02:58,000
-12,288 cells per frame, one full inference each, all in ring-0 assembly - bit-exact against the Python reference, cell for cell.
-
-24
-00:02:58,000 --> 00:03:07,000
-The right panel is the model at work: the probe cell's input, hidden layer and output scores, the W1/W2 weight maps, and the multiply-adds, one per frame.
-
-25
-00:03:07,000 --> 00:03:19,000
-Only 5 fps in QEMU; 10 fps running natively on the real machine. This clip is a QEMU recording - the real machine comes next.
-
-26
-00:03:19,700 --> 00:03:26,000
-Real machine, filmed by phone: on that 2009 screen, the left is a face its own neural network computes live, the right is the computation panel, 10 fps.
-
-27
-00:03:26,000 --> 00:03:32,500
-No operating system, no GPU acceleration - every character is inferred, cell by cell, by this CPU.
-
-28
-00:03:32,500 --> 00:03:39,200
-From the worm's brain to your face, the three pieces share one foundation: PXE network boot, a ring-0 instruction set, fixed-point integers, SSE2.
-
-29
-00:03:39,600 --> 00:03:43,500
+00:01:11,300 --> 00:01:14,500
 None of it has an operating system - no drivers, no runtime, not a line of C - all hand-written x86 assembly.
 
-30
-00:03:43,500 --> 00:03:47,200
+14
+00:01:14,500 --> 00:01:17,000
 And so a scrapped laptop became bare-metal compute that can see, can think, and can be driven over the network.

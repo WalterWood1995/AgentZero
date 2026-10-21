@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """make_bgm.py - synthesize a royalty-free ambient electronic background track.
 
-python make_bgm.py <out.wav> <seconds> [--sections "0:calm,84:bright,113:dense"]
+python make_bgm.py <out.wav> <seconds> [--sections "0:calm,84:bright,113:dense"] [--cheer]
+--cheer: 120 bpm, major-key "cheer" style, 16th-note arpeggio, synthesized kick/snare/hi-hat.
 Sections (start second: style) vary the chord set and arpeggio density so a long
 film does not feel static. Pure numpy; no samples, no copyrighted material.
 """
@@ -26,7 +27,12 @@ STYLES = {
                [N(10), N(15), N(19), N(22), N(19), N(15), N(12), N(15)], 0.95, 0.07),
     "dense":  ([(N(0), N(3), N(7)), (N(-4), N(0), N(3)), (N(-2), N(2), N(5)), (N(-9), N(-5), N(-2))],
                [N(7), N(10), N(14), N(19), N(22), N(19), N(14), N(10)], 1.0, 0.09),
+    # cheerful: major key (C - G - Am - F), bouncy 16th arpeggio, drums on
+    "cheer":  ([(N(3), N(7), N(10)), (N(-2), N(2), N(5)), (N(0), N(3), N(7)), (N(-4), N(0), N(3))],
+               [N(15), N(19), N(22), N(27), N(24), N(22), N(19), N(17), N(15), N(19), N(24), N(22)], 1.0, 0.07),
 }
+BPM = 120 if "--cheer" in sys.argv else 90
+DRUMS = "--cheer" in sys.argv
 bar = 4.0
 pad = np.zeros(n); arp = np.zeros(n); bass = np.zeros(n)
 
@@ -54,7 +60,7 @@ for i in range(int(dur / bar) + 1):
     e1 = min(n, s0 + int(2.5 * sr)); tt = t[s0:e1] - t[s0]
     bass[s0:e1] += 0.12 * np.exp(-tt * 1.2) * np.sin(2 * np.pi * f * tt)
 
-step = 60 / 90 / 2
+step = 60 / BPM / (4 if DRUMS else 2)
 k = 0; tpos = 0.0
 while tpos < dur:
     _, seq, dens, _ = STYLES[style_at(tpos)]
@@ -64,7 +70,24 @@ while tpos < dur:
         arp[s0:e0] += 0.07 * np.exp(-tt * 3.0) * (np.sin(2 * np.pi * f * tt) + 0.3 * np.sin(2 * np.pi * 2 * f * tt))
     k += 1; tpos += step
 
-mix = pad + arp + bass
+drums = np.zeros(n)
+if DRUMS:
+    beat = 60 / BPM
+    tpos = 0.0; b = 0
+    while tpos < dur:
+        s0 = int(tpos * sr)
+        if b % 2 == 0:                                   # kick on 1 and 3
+            e0 = min(n, s0 + int(0.25 * sr)); tt = t[s0:e0] - t[s0]
+            drums[s0:e0] += 0.35 * np.exp(-tt * 18) * np.sin(2 * np.pi * (55 + 80 * np.exp(-tt * 40)) * tt)
+        else:                                            # soft snare/clap on 2 and 4
+            e0 = min(n, s0 + int(0.12 * sr))
+            drums[s0:e0] += 0.12 * np.exp(-(t[s0:e0] - t[s0]) * 30) * rng.normal(0, 1, e0 - s0)
+        for h in (0, 0.5):                               # hi-hat on 8ths
+            s1 = int((tpos + h * beat) * sr); e1 = min(n, s1 + int(0.04 * sr))
+            if s1 < n:
+                drums[s1:e1] += (0.05 if h == 0 else 0.035) * np.exp(-(t[s1:e1] - t[s1]) * 90) * rng.normal(0, 1, e1 - s1)
+        tpos += beat; b += 1
+mix = pad + arp + bass + drums
 outp = mix.copy(); d = int(0.31 * sr)
 for g in (0.35, 0.18):
     outp[d:] += g * mix[:-d]; d = int(d * 1.6)
