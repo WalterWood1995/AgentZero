@@ -326,13 +326,24 @@ class Captions(threading.Thread):
 
 # ----------------------------------------------------------------- sources
 def open_camera(index, width=640, height=480):
+    """index = number, or -1 = auto: the first camera whose frames arrive in < 300 ms
+    (a stuck DirectShow device can answer at exactly 1 frame/s - skip it)."""
     import cv2
-    cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-    if not cap.isOpened():
-        sys.exit("camera %d could not be opened (check Windows camera privacy settings / index)" % index)
-    return cap
+    for idx in ([index] if index >= 0 else [0, 1, 2, 3]):
+        cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+        if not cap.isOpened():
+            continue
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        ok, dt = True, 0.0
+        for _ in range(3):
+            t = time.time(); ok, _fr = cap.read(); dt = time.time() - t
+        if ok and (index >= 0 or dt < 0.3):
+            print("camera %d: %.0f ms/frame" % (idx, dt * 1000), flush=True)
+            return cap
+        print("camera %d: %s, skipping" % (idx, "no frame" if not ok else "%.0f ms/frame" % (dt * 1000)), flush=True)
+        cap.release()
+    sys.exit("no usable camera (check Windows camera privacy settings / --list)")
 
 
 def list_cameras(n=5):
@@ -360,7 +371,7 @@ def main():
     ap.add_argument("--screen", default="128x96", help="kernel console grid: 128x96 (pxe_cam.img) or 80x50 (older images)")
     ap.add_argument("--cols", type=int, default=0, help="portrait width in cells (default: 4:3 filling the height)")
     ap.add_argument("--rows", type=int, default=0, help="portrait height in cells (default: screen rows - 6)")
-    ap.add_argument("--cam", type=int, default=0, help="camera index (see --list)")
+    ap.add_argument("--cam", type=int, default=-1, help="camera index (see --list); default auto")
     ap.add_argument("--list", action="store_true", help="enumerate cameras and exit")
     ap.add_argument("--source", default=None, help="video/image file instead of the camera")
     ap.add_argument("--mirror", action="store_true", help="flip horizontally (selfie view)")
