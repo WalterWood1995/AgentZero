@@ -271,7 +271,7 @@ class Screen:
     def read_pixel(self, geo, row, col):
         w, h, pitch, bpp = geo
         x0, y0 = max(0, (w - SCR_COLS * 8) // 2), max(0, (h - SCR_ROWS * 8) // 2)
-        off = (y0 + row * 8 + 3) * pitch + (x0 + col * 8 + 1) * 4   # a pixel '@' lights (ROM font row 3, col 1)
+        off = (y0 + row * 8 + 3) * pitch + (x0 + col * 8) * 4   # pixel (0,3) of '@' is lit in the QEMU and Asus ROM fonts
         try:
             self.sock.sendto(b"Y%08X%04X" % (off, 16), (self.ip, self.port))
             data, _ = self.sock.recvfrom(64)

@@ -23,7 +23,7 @@ while time.time() - t0 < mins * 60:
             # light a cell at row 95 col 126 (only exists on the big grid) and read the pixel back
             w, h, pitch, bpp = struct.unpack("<4I", d[:16])
             s.sendto(b"S5F7E@", (ip, 50000)); time.sleep(0.2)
-            off = (95 * 8 + 3) * pitch + (126 * 8 + 1) * 4
+            off = (95 * 8 + 3) * pitch + (126 * 8) * 4   # glyph pixel (0,3) of "@" is lit in both the QEMU and the Asus ROM font
             s.sendto(b"Y%08X%04X" % (off, 16), (ip, 50000))
             px, _ = s.recvfrom(64)
             if px[:3] == b"\xff\xff\xff" or px[1] > 0:
