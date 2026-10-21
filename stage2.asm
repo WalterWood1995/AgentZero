@@ -584,6 +584,13 @@ pm_entry:
     mov [our_ip], edx
 %ifdef NIC_NATIVE
     mov eax, [our_ip]              ; take over the NIC with the native e1000 driver
+%ifdef NIC_AR8131
+    mov eax, 0x72B2A8C0            ; real Asus boots via proxyDHCP, so GET_CACHED_INFO is
+    mov [our_ip], eax             ; unreliable (returns 0 or garbage). Force the router-
+                                   ; assigned .114 so the native IP stack always has a
+                                   ; valid source/filter IP (else TX src is bogus and the
+                                   ; dev PC drops it, and RX rejects packets for .114).
+%endif
     mov [nn_ip], eax              ; (PXE was used only to learn our DHCP IP)
     call nn_init
 %else
@@ -762,6 +769,7 @@ net_loop:
 %ifdef NIC_AR8131
     call ar_hud                    ; live NIC diagnostics on the bottom text row
     mov byte [need_present], 1
+    call ar_rxdiag                 ; broadcast RX state over working TX (autonomous RX debug)
 %endif
     ; drain the PS/2 keyboard fully this iteration (no overflow/beep on fast
     ; typing); each mapped key echoes, Enter sends the line over UDP
@@ -824,6 +832,8 @@ net_loop:
     je  .do_block_q               ;     last packet of the frame is a 'B' -> one repaint)
     cmp byte [rx_buf], 'g'         ; g = raw 8-bit grey rows -> THIS CPU maps brightness to
     je  .do_gray                   ;     ramp chars + 3 attributes (ascii_cam --kernel-render)
+    cmp byte [rx_buf], 'i'         ; i = grey rows into the NN input grid; flag 1 = run the
+    je  .do_nnin                   ;     fixed-point MLP on this CPU -> glyph per cell (--nn)
     cmp byte [rx_buf], 'L'         ; L = bulk-load raw bytes into the compute scratch RAM
     je  .do_load
     cmp byte [rx_buf], 'E'         ; E = evaluate the Fourier epicycle chain at a time step
@@ -1002,6 +1012,38 @@ net_loop:
 .gr_done:
     cmp byte [blk_pres], 0
     je  .poll
+    mov byte [need_present], 1
+    jmp .poll
+.do_nnin:
+    ; i<2hex row><1hex run><raw grey, SCR_COLS per row>: store rows in NN_GRAY; run=1 ->
+    ; nn_render: this CPU's fixed-point MLP (weights L-loaded at NN_W) picks a glyph per
+    ; cell from its 3x3 neighbourhood, attribute by brightness -> text buffer + repaint.
+    mov byte [rain_on], 0
+    mov dword [parse_ptr], rx_buf + 1
+    mov bl, 2
+    call phex                      ; start row
+    and eax, 0x7F
+    imul edi, eax, SCR_COLS
+    add edi, NN_GRAY
+    mov bl, 1
+    call phex                      ; run flag
+    and al, 1
+    mov [blk_pres], al
+    mov esi, [parse_ptr]
+    lea ecx, [rx_buf + ecx]
+    sub ecx, esi                   ; grey bytes in the packet
+    jbe .nn_chk
+    mov edx, NN_GRAY + SCR_CELLS
+    sub edx, edi                   ; room left in the grid
+    cmp ecx, edx
+    jbe .nn_cp
+    mov ecx, edx
+.nn_cp:
+    rep movsb
+.nn_chk:
+    cmp byte [blk_pres], 0
+    je  .poll
+    call nn_render
     mov byte [need_present], 1
     jmp .poll
 .do_gfxon:                         ; V: (graphics console is always on) - just ack
@@ -2869,6 +2911,153 @@ pc_prot32:
     mov gs, ax
     mov ss, ax
     mov esp, [pm_esp]
+    popad
+    ret
+
+; ================= the old PC's own neural network: grey cells -> ASCII ==========
+; nn_render: NN_GRAY (SCR_ROWS x SCR_COLS grey) -> glyph + attribute per cell with the
+; fixed-point MLP whose weights the host L-loaded at NN_W. Blob (nnascii.py pack()):
+;   "NNA1" nin(2) nh(2) nout(2) | t1 t2 | 16 glyph bytes | W1 i16[32][9] | b1 i32[32]
+;   | W2 i16[16][32] | b2 i32[16]       (9 -> 32 relu -> 16, argmax; mirrors infer_q)
+NN_W     equ 0x00140000            ; weights blob (compute window, L-loaded)
+NN_GRAY  equ 0x00150000            ; SCR_CELLS grey bytes (the 'i' command fills it)
+NN_X     equ 0x00154000            ; i32[9]  3x3 input scratch
+NN_H     equ 0x00154040            ; i32[32] hidden scratch
+NN_BEST  equ 0x001540C0            ; argmax running best / index
+NN_W1    equ NN_W + 28
+NN_B1    equ NN_W + 28 + 32*9*2
+NN_W2    equ NN_B1 + 32*4
+NN_B2    equ NN_W2 + 16*32*2
+nn_render:
+    pushad
+    cmp dword [NN_W], 0x31414E4E   ; "NNA1": no weights loaded -> nothing to do
+    jne .done
+    xor ebx, ebx                   ; row
+.row:
+    xor ecx, ecx                   ; col
+.col:
+    push ecx
+    ; gather the edge-clamped 3x3 neighbourhood into NN_X
+    mov edi, NN_X
+    mov edx, -1                    ; dr
+.gr:
+    mov eax, ebx
+    add eax, edx
+    jns .r0
+    xor eax, eax
+.r0:
+    cmp eax, SCR_ROWS - 1
+    jbe .r1
+    mov eax, SCR_ROWS - 1
+.r1:
+    imul eax, eax, SCR_COLS
+    push edx
+    mov edx, -1                    ; dc
+.gc:
+    mov esi, ecx
+    add esi, edx
+    jns .c0
+    xor esi, esi
+.c0:
+    cmp esi, SCR_COLS - 1
+    jbe .c1
+    mov esi, SCR_COLS - 1
+.c1:
+    add esi, eax
+    movzx esi, byte [NN_GRAY + esi]
+    mov [edi], esi
+    add edi, 4
+    inc edx
+    cmp edx, 2
+    jl  .gc
+    pop edx
+    inc edx
+    cmp edx, 2
+    jl  .gr
+    ; layer 1: h[j] = clamp((W1[j].x + b1[j]) >> 6, 0, 4095)
+    mov esi, NN_W1
+    mov edi, NN_H
+    mov ecx, 32
+.l1:
+    push ecx
+    xor eax, eax
+    mov ebp, NN_X
+    mov ecx, 9
+.l1i:
+    movsx edx, word [esi]
+    imul edx, [ebp]
+    add eax, edx
+    add esi, 2
+    add ebp, 4
+    dec ecx
+    jnz .l1i
+    pop ecx
+    mov edx, 32
+    sub edx, ecx                   ; j
+    add eax, [NN_B1 + edx*4]
+    sar eax, 6
+    jns .h0
+    xor eax, eax
+.h0:
+    cmp eax, 4095
+    jbe .h1
+    mov eax, 4095
+.h1:
+    mov [edi], eax
+    add edi, 4
+    dec ecx
+    jnz .l1
+    ; layer 2: out[k] = W2[k].h + b2[k]; argmax (first max wins, like numpy)
+    mov esi, NN_W2
+    xor ecx, ecx                   ; k
+    mov dword [NN_BEST], 0x80000000
+    mov dword [NN_BEST + 4], 0
+.l2:
+    push ecx
+    xor eax, eax
+    mov ebp, NN_H
+    mov ecx, 32
+.l2j:
+    movsx edx, word [esi]
+    imul edx, [ebp]
+    add eax, edx
+    add esi, 2
+    add ebp, 4
+    dec ecx
+    jnz .l2j
+    pop ecx
+    add eax, [NN_B2 + ecx*4]
+    cmp eax, [NN_BEST]
+    jle .nb
+    mov [NN_BEST], eax
+    mov [NN_BEST + 4], ecx
+.nb:
+    inc ecx
+    cmp ecx, 16
+    jl  .l2
+    pop ecx                        ; col
+    mov eax, [NN_BEST + 4]
+    mov al, [NN_W + 12 + eax]      ; glyph byte
+    mov edx, [NN_X + 16]           ; centre grey -> attribute tier
+    mov ah, 0x02
+    cmp dl, [NN_W + 10]
+    jb  .at
+    mov ah, 0x0A
+    cmp dl, [NN_W + 11]
+    jb  .at
+    mov ah, 0x0F
+.at:
+    mov edi, ebx
+    imul edi, edi, SCR_COLS
+    add edi, ecx
+    mov [VGA + edi*2], ax
+    inc ecx
+    cmp ecx, SCR_COLS
+    jl  .col
+    inc ebx
+    cmp ebx, SCR_ROWS
+    jl  .row
+.done:
     popad
     ret
 

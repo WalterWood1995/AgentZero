@@ -221,8 +221,9 @@ class Screen:
             self.send(head + b"\n".join(body))
         return len(packets)
 
-    def gray_frame(self, cells, col0, row0=0):
-        """Kernel-render mode: g<row><repaint flag><raw bytes, 80 per row>."""
+    def gray_frame(self, cells, col0, row0=0, cmd=b"g"):
+        """Kernel-render mode: g<row><repaint flag><raw bytes, SCR_COLS per row> (table
+        lookup on the old PC) or, with cmd=b"i", the old PC's neural network (--nn)."""
         rows, cols = cells.shape
         full = np.zeros((rows, SCR_COLS), dtype=np.uint8)
         full[:, col0:col0 + cols] = cells
@@ -230,9 +231,22 @@ class Screen:
         parts = list(range(0, rows, rpp))
         for i, r in enumerate(parts):
             last = i == len(parts) - 1
-            head = b"g%02X%d" % (row0 + r, 1 if last else 0)
+            head = cmd + b"%02X%d" % (row0 + r, 1 if last else 0)
             self.send(head + full[r:r + rpp].tobytes())
         return len(parts)
+
+    def load_nn(self):
+        """Put nnascii/weights.bin into the old PC's RAM (L, verified) for the 'i' command."""
+        sys.path.insert(0, os.path.join(HERE, "organism")); sys.path.insert(0, os.path.join(HERE, "nnascii"))
+        from hw import HW
+        import nnascii
+        blob = open(nnascii.WEIGHTS, "rb").read()
+        hw = HW(self.ip, port=self.port, timeout=1.5)
+        for _ in range(3):
+            if hw.load(nnascii.NN_W_ADDR, blob, chunk=512, verify=True):
+                print("neural net weights (%d B) loaded into the old PC at 0x%X" % (len(blob), nnascii.NN_W_ADDR), flush=True)
+                return True
+        return False
 
     def dario(self):
         """Draw the kernel's own Dario face (face_data.inc) on the right - dual layout."""
@@ -388,6 +402,8 @@ def main():
     ap.add_argument("--no-clahe", action="store_true", help="plain global autocontrast only")
     ap.add_argument("--kernel-render", action="store_true",
                     help="send raw grey bytes; the old PC's CPU maps brightness to chars (g command)")
+    ap.add_argument("--nn", action="store_true",
+                    help="send raw grey bytes; the old PC's CPU runs the trained MLP (nnascii) that picks each glyph")
     ap.add_argument("--layout", default="single", choices=["single", "dual", "brain"],
                     help="dual: you (36x36, left) + Dario face (right); agent_chat text fits below; "
                          "brain: you (left) + the C. elegans brain computed by the old PC (right)")
@@ -458,7 +474,7 @@ def main():
         if sense["prev"] is not None:                    # motion energy inside the face box
             sense["motion"] = float(np.abs(g32 - sense["prev"]).mean() / 64.0)
         sense["prev"] = g32
-        if a.kernel_render:
+        if a.kernel_render or a.nn:
             return rend.gray_cells(gray), None
         return rend.render(gray)
 
@@ -475,6 +491,8 @@ def main():
     scr = Screen(a.ip, a.port, repeat=a.repeat, gap=a.gap, rows_per_packet=a.rows_per_packet, legacy=a.legacy,
                  max_packet=a.max_packet)
     scr.clear()
+    if a.nn and not scr.load_nn():
+        sys.exit("could not load the NN weights into the kernel (needs pxe_cam.img with the i command)")
     if a.layout == "dual":
         scr.dario()
     brain = None
@@ -547,7 +565,7 @@ def main():
                     full_l.append(left + pl[r]); full_t.append(lt + pt[r])
                 lines, tiers = full_l, full_t
             if tiers is None:
-                pk_frame = scr.gray_frame(lines, col0)
+                pk_frame = scr.gray_frame(lines, col0, cmd=b"i" if a.nn else b"g")
             else:
                 pk_frame = scr.frame(lines, tiers, col0)
             tc = time.time()
