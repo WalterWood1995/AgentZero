@@ -14,6 +14,17 @@ s.settimeout(1.0)
 t0 = time.time()
 print("waiting for %s (up to %.0f min)..." % (ip, mins), flush=True)
 import struct
+if "--after-reboot" in sys.argv:                           # same-geometry kernel already up:
+    extra = [a for a in extra if a != "--after-reboot"]    # wait for it to go silent first
+    quiet = 0
+    print("waiting for the machine to go down (power cycle)...", flush=True)
+    while quiet < 4 and time.time() - t0 < mins * 60:
+        try:
+            s.sendto(b"Q\0", (ip, 50000)); s.recvfrom(64); quiet = 0
+        except (socket.timeout, OSError):
+            quiet += 1
+        time.sleep(1.5)
+    print("down; waiting for the new boot", flush=True)
 while time.time() - t0 < mins * 60:
     try:
         s.sendto(b"Q\0", (ip, 50000))
