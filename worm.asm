@@ -20,9 +20,9 @@
 
 NSEG        equ 24
 SEG_LEN     equ 9
-DISH_CX     equ 400
-DISH_CY     equ 400
-DISH_R      equ 340
+DISH_CX     equ 300
+DISH_CY     equ 420
+DISH_R      equ 260
 FOOD_R      equ 180
 FOOD_R2     equ FOOD_R * FOOD_R
 EAT_R       equ 24
@@ -79,15 +79,27 @@ C_VENTRAL   equ 0x00FF9040
 C_HUD       equ 0x0080FF80
 C_HUD2      equ 0x00608060
 
-; raster panel geometry
-RX          equ 776
-RY          equ 84
-CELL        equ 10
-COLS        equ 22
-SENS_Y      equ RY + 12
-INTER_Y     equ RY + 70
-MOTOR_Y     equ RY + 138
-MUSC_Y      equ RY + 230
+; brain graph panel: 302 neurons as nodes in three layered column groups
+; (sensory -> interneurons -> motor), the strongest synapses drawn as dim lines
+; in the background, and a neuron's outgoing synapses flash when it fires.
+GX_S        equ 604                ; sensory columns x (2 cols, 40 apart)
+GX_I        equ 744                ; interneuron columns x (3 cols)
+GX_M        equ 924                ; motor columns x (3 cols)
+GY          equ 84
+ROWS_S      equ 43
+ROWS_I      equ 34
+ROWS_M      equ 38
+PITCH_S     equ 12
+PITCH_I     equ 15
+PITCH_M     equ 13
+NODE        equ 6                  ; node square size
+%ifndef EDGE_THR
+EDGE_THR    equ 8                  ; |weight| >= this -> the synapse is drawn in the background
+%endif
+FLASH_THR   equ 12                 ; |weight| >= this -> it flashes when the neuron fires
+C_EDGE      equ 0x00141E14         ; static synapse lines (dim)
+RX          equ 604                ; muscle bars / labels x
+MUSC_Y      equ 620
 MUSC_H      equ 28
 
 ; keys (set 1 scancodes)
@@ -140,6 +152,7 @@ worm_pm:
     call brain_init
     test eax, eax
     jz  .badbrain
+    call graph_init
     mov ecx, SPLASH_FRAMES
 .sp:
     push ecx
@@ -187,7 +200,7 @@ worm_reset:
 .p:
     mov eax, ecx
     imul eax, -SEG_LEN
-    add eax, DISH_CX - 140
+    add eax, DISH_CX - 40
     shl eax, 8
     mov [wx + ecx*4], eax
     mov dword [wy + ecx*4], DISH_CY << 8
@@ -203,8 +216,8 @@ worm_reset:
     mov dword [w_spd], 0
     mov dword [w_touch_head], 0
     mov dword [w_touch_tail], 0
-    mov dword [w_food_x], DISH_CX + 150
-    mov dword [w_food_y], DISH_CY - 110
+    mov dword [w_food_x], DISH_CX + 120
+    mov dword [w_food_y], DISH_CY - 100
     mov dword [w_food_on], 1
     mov dword [w_food_timer], 0
     mov dword [w_c_now], 0
@@ -962,15 +975,15 @@ place_food:
     call arc_rand
     mov ebx, eax
     xor edx, edx
-    mov ecx, 440
+    mov ecx, 320
     div ecx
-    add edx, DISH_CX - 220
+    add edx, DISH_CX - 160
     mov [w_food_x], edx
     mov eax, ebx
     shr eax, 16
     xor edx, edx
     div ecx
-    add edx, DISH_CY - 220
+    add edx, DISH_CY - 160
     mov [w_food_y], edx
 .clamp:
     mov eax, [w_food_x]
@@ -1073,6 +1086,7 @@ bg_draw_all:
     cmp ebx, DISH_R
     jle .row
     call draw_food_glow
+    call graph_static_edges        ; dim synapse lines into the background layer
     mov eax, [w_lfb_save]
     mov [lfb_phys], eax
     popad
@@ -1123,7 +1137,7 @@ draw_food_glow:
     add edx, [w_food_x]
     cmp edx, 0
     jl  .nx
-    cmp edx, 768                   ; keep the glow off the raster panel
+    cmp edx, 580                   ; keep the glow off the brain graph
     jge .nx
     push eax
     mov eax, edx                   ; clip the glow to the agar disc
@@ -1319,7 +1333,7 @@ worm_render:
     mov esi, C_FINGER
     call rect
 .nfinger:
-    call raster_draw
+    call graph_draw
     call muscles_draw
     call hud_status
     ret
@@ -1384,68 +1398,261 @@ drawn_positions:
     popad
     ret
 
-; raster_draw: all 302 neurons, grouped sensory / inter / motor
-raster_draw:
-    xor ecx, ecx                   ; neuron index
+; graph_init: node_x/node_y[i] for the 302 neurons (layered columns per group)
+graph_init:
+    pushad
+    xor ecx, ecx
 .n:
     mov eax, ecx
-    mov edx, SENS_Y
-    mov esi, C_SENS
+    mov ebx, GX_S
+    mov esi, ROWS_S
+    mov edi, PITCH_S
     cmp ecx, [br_sens_end]
     jb  .g
     sub eax, [br_sens_end]
-    mov edx, INTER_Y
-    mov esi, C_INTER
+    mov ebx, GX_I
+    mov esi, ROWS_I
+    mov edi, PITCH_I
     cmp ecx, [br_inter_end]
     jb  .g
     mov eax, ecx
     sub eax, [br_inter_end]
-    mov edx, MOTOR_Y
-    mov esi, C_MOTOR
+    mov ebx, GX_M
+    mov esi, ROWS_M
+    mov edi, PITCH_M
 .g:
-    push ecx
-    push edx
     xor edx, edx
-    mov ebx, COLS
-    div ebx                        ; eax = row, edx = col
-    imul eax, CELL
-    pop ebx
-    add ebx, eax                   ; y
-    imul eax, edx, CELL
-    add eax, RX                    ; x
-    ; brightness: fired -> full, v > thr/2 -> half, else quarter
-    mov ecx, [esp]
+    div esi                        ; eax = column, edx = row
+    imul eax, 40
+    add eax, ebx
+    mov [node_x + ecx*2], ax
+    imul edx, edi
+    add edx, GY
+    mov [node_y + ecx*2], dx
+    inc ecx
+    cmp ecx, 302
+    jb  .n
+    mov byte [flash_n], 0
+    popad
+    ret
+
+; node_colour: ECX = neuron -> ESI = group colour
+node_colour:
+    mov esi, C_SENS
+    cmp ecx, [br_sens_end]
+    jb  .d
+    mov esi, C_INTER
+    cmp ecx, [br_inter_end]
+    jb  .d
+    mov esi, C_MOTOR
+.d:
+    ret
+
+; draw_edges: ECX = source neuron; draws its synapses with |w| >= EDGE_THR to other
+; neurons as lines from node centre to node centre. ESI = colour, or -1 = restore
+; the background pixels (undo a flash). Preserves all registers.
+draw_edges:
+    pushad
+    mov [w_lcol], esi
+    mov dword [w_ethr], EDGE_THR
+    cmp esi, C_EDGE
+    je  .thr
+    mov dword [w_ethr], FLASH_THR  ; flashes (and their undo) use the higher threshold
+.thr:
+    mov esi, [br_blob]
+    lea ebp, [esi+128]              ; offsets
+    lea edx, [esi+128+612]          ; entries
+    movzx eax, word [ebp+ecx*2]
+    movzx ebx, word [ebp+ecx*2+2]
+    mov [w_eend], ebx
+    movzx ebx, word [node_x + ecx*2]
+    add ebx, NODE / 2
+    mov [w_lx0], ebx
+    movzx ebx, word [node_y + ecx*2]
+    add ebx, NODE / 2
+    mov [w_ly0], ebx
+.e:
+    cmp eax, [w_eend]
+    jae .d
+    movzx ebx, word [edx+eax*2]
+    mov edi, ebx
+    and edi, 0x1FF                  ; dst
+    cmp edi, 302
+    jae .next
+    shl ebx, 16
+    sar ebx, 25                     ; weight
+    cmp ebx, 0
+    jge .pos
+    neg ebx
+.pos:
+    cmp ebx, [w_ethr]
+    jl  .next
+    movzx ebx, word [node_x + edi*2]
+    add ebx, NODE / 2
+    mov [w_lx1], ebx
+    movzx ebx, word [node_y + edi*2]
+    add ebx, NODE / 2
+    mov [w_ly1], ebx
+    push eax
+    push edx
+    call draw_line
+    pop edx
+    pop eax
+.next:
+    inc eax
+    jmp .e
+.d:
+    popad
+    ret
+
+; draw_line: ([w_lx0],[w_ly0]) -> ([w_lx1],[w_ly1]) into the current [lfb_phys],
+; colour [w_lcol] (or -1 = copy the pixel from BG_LAYER). Bresenham, no clipping
+; (all nodes lie inside the screen). Clobbers EAX..EDI; preserves EBP.
+draw_line:
+    push ebp
+    mov eax, [w_lx0]
+    mov ebx, [w_ly0]
+    mov ecx, [w_lx1]
+    sub ecx, eax                    ; dx
+    mov edx, [w_ly1]
+    sub edx, ebx                    ; dy
+    mov dword [w_sx], 4             ; step in bytes
+    cmp ecx, 0
+    jge .dxp
+    neg ecx
+    mov dword [w_sx], -4
+.dxp:
+    mov esi, [lfb_pitch]
+    mov [w_sy], esi
+    cmp edx, 0
+    jge .dyp
+    neg edx
+    neg dword [w_sy]
+.dyp:
+    mov [w_ldx], ecx
+    mov [w_ldy], edx
+    mov edi, ecx
+    sub edi, edx                    ; err = dx - dy
+    mov esi, ebx
+    imul esi, [lfb_pitch]
+    lea esi, [esi + eax*4]          ; byte offset of the first pixel
+    cmp ecx, edx
+    jge .len
+    mov ecx, edx
+.len:
+    inc ecx                         ; pixel count = max(dx,dy)+1
+    mov ebx, [w_lcol]               ; colour (or -1)
+    mov ebp, [lfb_phys]
+.px:
+    mov eax, ebx
+    cmp ebx, -1
+    jne .put
+    mov eax, [BG_LAYER + esi]
+.put:
+    mov [ebp + esi], eax
+    dec ecx
+    jz  .d
+    lea eax, [edi + edi]            ; e2 = 2*err
+    mov edx, [w_ldy]
+    neg edx
+    cmp eax, edx                    ; e2 > -dy ?
+    jle .ny
+    sub edi, [w_ldy]
+    add esi, [w_sx]
+.ny:
+    cmp eax, [w_ldx]                ; e2 < dx ?
+    jge .px
+    add edi, [w_ldx]
+    add esi, [w_sy]
+    jmp .px
+.d:
+    pop ebp
+    ret
+
+; graph_static_edges: all strong synapses as dim lines into the current target
+; (called by bg_draw_all with [lfb_phys] = BG_LAYER)
+graph_static_edges:
+    pushad
+    xor ecx, ecx
+.n:
+    mov esi, C_EDGE
+    call draw_edges
+    inc ecx
+    cmp ecx, 302
+    jb  .n
+    popad
+    ret
+
+; graph_draw: undo last frame's flashes, flash the synapses of the neurons that
+; fired this step, then draw all 302 nodes on top (fired = bright, v high = half)
+graph_draw:
+    pushad
+    movzx ebx, byte [flash_n]
+    xor edx, edx
+.undo:
+    cmp edx, ebx
+    jae .undone
+    movzx ecx, word [flash_list + edx*2]
+    mov esi, -1
+    call draw_edges
+    inc edx
+    jmp .undo
+.undone:
+    xor edx, edx                    ; new flash count
+    xor ecx, ecx
+.f:
+    cmp word [BR_S + ecx*2], 0
+    je  .nf
+    cmp edx, FLASH_MAX
+    jae .nf
+    mov [flash_list + edx*2], cx
+    inc edx
+    call node_colour
+    call draw_edges
+.nf:
+    inc ecx
+    cmp ecx, 302
+    jb  .f
+    mov [flash_n], dl
+    ; nodes
+    xor ecx, ecx
+.node:
+    call node_colour
     cmp word [BR_S + ecx*2], 0
     jne .full
-    movsx edx, word [BR_V + ecx*2]
+    movsx eax, word [BR_V + ecx*2]
     movsx edi, word [BR_THR + ecx*2]
     sar edi, 1
-    cmp edx, edi
+    cmp eax, edi
     jge .half
     shr esi, 2
     and esi, 0x003F3F3F
-    jmp .draw
+    jmp .put
 .half:
     shr esi, 1
     and esi, 0x007F7F7F
-    jmp .draw
+    jmp .put
 .full:
-    or  esi, 0x00808080            ; flash towards white
-.draw:
-    mov ecx, 8
-    mov edx, 8
+    or  esi, 0x00A0A0A0
+.put:
+    movzx eax, word [node_x + ecx*2]
+    movzx ebx, word [node_y + ecx*2]
+    push ecx
+    mov ecx, NODE
+    mov edx, NODE
     call rect
     pop ecx
     inc ecx
     cmp ecx, 302
-    jb  .n
+    jb  .node
+    popad
     ret
 
 ; muscles_draw: 24 dorsal (up) / ventral (down) bars from the muscle rows' v
 muscles_draw:
     mov eax, RX
     mov ebx, MUSC_Y
-    mov ecx, COLS * CELL
+    mov ecx, 24 * 9 + 4
     mov edx, MUSC_H * 2 + 2
     mov esi, C_BLACK
     call rect
@@ -1566,24 +1773,24 @@ hud_static:
     mov dword [t_y], 42
     mov esi, s_w_hud3
     call arc_text
-    ; raster labels
-    mov dword [t_x], RX
-    mov dword [t_y], RY - 14
+    ; graph labels
+    mov dword [t_x], GX_S
+    mov dword [t_y], GY - 26
     mov dword [t_col], C_WHITE
     mov esi, s_w_live
     call arc_text
-    mov dword [t_x], RX
-    mov dword [t_y], SENS_Y - 11
+    mov dword [t_x], GX_S
+    mov dword [t_y], GY - 13
     mov dword [t_col], C_SENS
     mov esi, s_w_sens
     call arc_text
-    mov dword [t_x], RX
-    mov dword [t_y], INTER_Y - 11
+    mov dword [t_x], GX_I
+    mov dword [t_y], GY - 13
     mov dword [t_col], C_INTER
     mov esi, s_w_inter
     call arc_text
-    mov dword [t_x], RX
-    mov dword [t_y], MOTOR_Y - 11
+    mov dword [t_x], GX_M
+    mov dword [t_y], GY - 13
     mov dword [t_col], C_MOTOR
     mov esi, s_w_motor
     call arc_text
@@ -1858,10 +2065,10 @@ s_w_hud1    db "C.ELEGANS  302 NEURONS  ", 0
 s_w_hud1b   db " SYNAPSES  NO OS  X86 ASM", 0
 s_w_hud2    db "ASUS K50IJ (2009) - PXE BOOT, NO DISK - THE NETWORK IS NOT USED AFTER BOOT: PULL THE CABLE, IT KEEPS LIVING", 0
 s_w_hud3    db "REAL CONNECTOME (OPENWORM / WHITE 1986), CARTOON DYNAMICS: INTEGRATE-AND-FIRE, INT16 + SSE2, 120 BRAIN STEPS/S", 0
-s_w_live    db "BRAIN ACTIVITY - LIVE", 0
-s_w_sens    db "SENSORY (86)", 0
-s_w_inter   db "INTERNEURONS (102)", 0
-s_w_motor   db "MOTOR (114)", 0
+s_w_live    db "BRAIN LIVE - DOT=NEURON LINE=SYNAPSE FLASH=SPIKE", 0
+s_w_sens    db "SENSORY 86", 0
+s_w_inter   db "INTERNEURONS 102", 0
+s_w_motor   db "MOTOR 114", 0
 s_w_musc    db "BODY-WALL MUSCLES  DORSAL / VENTRAL", 0
 s_w_keys    db "H = POKE HEAD   T = POKE TAIL", 0
 s_w_keys2   db "F = DROP FOOD   R = RESET", 0
@@ -1935,4 +2142,21 @@ w_bias      dd 0
 w_tx        dd 0
 w_ty        dd 0
 w_lat       times NSEG dd 0        ; per-segment lateral offset (px) from the muscles
+w_lx0       dd 0                   ; draw_line / draw_edges scratch
+w_ly0       dd 0
+w_lx1       dd 0
+w_ly1       dd 0
+w_lcol      dd 0
+w_ldx       dd 0
+w_ldy       dd 0
+w_sx        dd 0
+w_sy        dd 0
+w_eend      dd 0
+w_ethr      dd 0
+FLASH_MAX   equ 302
+flash_n     db 0
+align 2
+flash_list  times FLASH_MAX dw 0   ; neurons whose synapses were flashed last frame
+node_x      times 302 dw 0         ; graph node positions
+node_y      times 302 dw 0
 %include "worm/data/tables.inc"

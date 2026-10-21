@@ -25,7 +25,7 @@ from wormsim import Brain, sat16
 NSEG = 24
 SEG = 9                 # px between body points
 W, H = 1024, 768
-DISH_CX, DISH_CY, DISH_R = 400, 400, 340      # petri dish (the right side holds the raster)
+DISH_CX, DISH_CY, DISH_R = 300, 420, 260      # petri dish (the right side holds the raster)
 FOOD_R = 180            # food glow radius (px)
 EAT_R = 24
 TOUCH_FRAMES = 120
@@ -94,7 +94,7 @@ class Worm:
 
     def reset(self):
         self.b.reset_state()
-        self.x = [(DISH_CX - 140 - i * SEG) << 8 for i in range(NSEG)]   # Q8 positions, head = 0
+        self.x = [(DISH_CX - 40 - i * SEG) << 8 for i in range(NSEG)]    # Q8 positions, head = 0
         self.y = [DISH_CY << 8] * NSEG
         self.heading = 0            # angle units, 0 = +x (facing right), 64 = +y (down)
         self.phase = 0
@@ -102,7 +102,7 @@ class Worm:
         self.bend = 0               # smoothed dorsal-ventral head muscle
         self.touch_head = 0
         self.touch_tail = 0
-        self.food_x, self.food_y = DISH_CX + 150, DISH_CY - 110
+        self.food_x, self.food_y = DISH_CX + 120, DISH_CY - 100
         self.food_on = 1
         self.food_amount = FOOD_AMOUNT
         self.c_now = 0
@@ -292,7 +292,7 @@ class Worm:
             fy = (self.y[0] >> 8) + ((200 * sin_q14(self.heading)) >> 14)
         else:
             r = self.rand()
-            fx = DISH_CX - 220 + (r % 440); fy = DISH_CY - 220 + ((r >> 16) % 440)
+            fx = DISH_CX - 160 + (r % 320); fy = DISH_CY - 160 + ((r >> 16) % 320)
         # keep it well inside the dish
         dx, dy = fx - DISH_CX, fy - DISH_CY
         d = isqrt(dx * dx + dy * dy)
