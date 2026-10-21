@@ -2969,6 +2969,8 @@ NN_X     equ 0x00154000            ; i32[9]  3x3 input scratch
 NN_H     equ 0x00154040            ; i32[32] hidden scratch
 NN_BEST  equ 0x001540C0            ; argmax running best / index
 NN_PROBE equ 0x001540D0            ; u32 row, u32 col: the cell whose computation is traced
+NN_LIMIT equ 0x001540D8            ; u32: render only columns < this (0 = all); the host's
+                                   ; side panel to the right is then left untouched (no flicker)
 NN_OUT   equ 0x00154100            ; i32[16] output scores of the cell being computed
 NN_TRACE equ 0x00154200            ; copy of 0x154000..0x154140 taken at the probe cell
 NN_W1    equ NN_W + 28
@@ -3115,8 +3117,13 @@ nn_render:
     add edi, ecx
     mov [VGA + edi*2], ax
     inc ecx
+    cmp ecx, [NN_LIMIT]
+    jb  .col
     cmp ecx, SCR_COLS
-    jl  .col
+    jae .nxrow
+    cmp dword [NN_LIMIT], 0        ; limit 0 = whole width
+    je  .col
+.nxrow:
     inc ebx
     cmp ebx, SCR_ROWS
     jl  .row

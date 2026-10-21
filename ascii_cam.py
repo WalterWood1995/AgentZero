@@ -258,8 +258,9 @@ class Screen:
             self.send(b"p%02X%02X%d\n" % (row0 + r, col, 1 if (last and repaint) else 0) + b"\n".join(body))
         return len(packets)
 
-    def load_nn(self):
-        """Put nnascii/weights.bin into the old PC's RAM (L, verified) for the 'i' command."""
+    def load_nn(self, limit_cols=0):
+        """Put nnascii/weights.bin into the old PC's RAM (L, verified) for the 'i' command;
+        limit_cols > 0 makes the net render only those columns (side panel stays put)."""
         sys.path.insert(0, os.path.join(HERE, "organism")); sys.path.insert(0, os.path.join(HERE, "nnascii"))
         from hw import HW
         import nnascii
@@ -268,6 +269,7 @@ class Screen:
         for _ in range(3):
             if hw.load(nnascii.NN_W_ADDR, blob, chunk=512, verify=True):
                 print("neural net weights (%d B) loaded into the old PC at 0x%X" % (len(blob), nnascii.NN_W_ADDR), flush=True)
+                hw.load(0x1540D8, struct.pack("<I", limit_cols), chunk=16, verify=True)   # NN_LIMIT
                 return True
         return False
 
@@ -522,7 +524,7 @@ def main():
     scr = Screen(a.ip, a.port, repeat=a.repeat, gap=a.gap, rows_per_packet=a.rows_per_packet, legacy=a.legacy,
                  max_packet=a.max_packet)
     scr.clear()
-    if a.nn and not scr.load_nn():
+    if a.nn and not scr.load_nn(limit_cols=a.cols if a.layout == "nn" else 0):
         sys.exit("could not load the NN weights into the kernel (needs pxe_cam.img with the i command)")
     if a.layout == "dual":
         scr.dario()
@@ -610,7 +612,7 @@ def main():
                     pl, pt = nnp.render(fps=nframes / max(time.time() - t0, 1e-6))
                     pr, pc = nnp.probe
                     scr.send(b"p%02X%02X0\n\x03@" % (pr, pc))     # mark the probe cell white
-                    pk_frame += 1 + scr.pblock(pl, pt, a.cols + 2)
+                    pk_frame += 1 + scr.pblock(pl, pt, a.cols + 2, repaint=False)   # shown by the next frame's repaint
             else:
                 pk_frame = scr.frame(lines, tiers, col0)
             tc = time.time()
