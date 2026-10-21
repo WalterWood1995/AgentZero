@@ -53,7 +53,7 @@ for L in zh en; do
   for f in s0_title_$L s1_c1_$L s2_worm_$L s3_c2_$L s4_nn_$L s5_end_$L; do echo "file '$f.mp4'" >> list_$L.txt; done
   ffmpeg -v error -y -f concat -safe 0 -i list_$L.txt -c copy cut_$L.mp4
   DUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 cut_$L.mp4)
-  [ -f bgm.wav ] || python "$P/make_bgm.py" bgm.wav $(( ${DUR%.*} + 1 )) --sections "0:cheer" --cheer
+  [ -f bgm.wav ] || python "$P/make_disco.py" bgm.wav $(( ${DUR%.*} + 1 )) --bpm 126
   cp "$P/agentzero_combo_$L.srt" $L.srt
   ffmpeg -v error -y -i cut_$L.mp4 -i bgm.wav -map 0:v -map 1:a -vf "subtitles=$L.srt:fontsdir=.:force_style='$STYLE'" \
     -c:v libx264 -preset slow -crf 23 -pix_fmt yuv420p -c:a aac -b:a 128k -ac 2 -shortest -movflags +faststart "$P/agentzero_combo_$L.mp4"

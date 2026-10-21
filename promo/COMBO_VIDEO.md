@@ -2,7 +2,7 @@
 
 成片：`promo/agentzero_combo_zh.mp4`（中文字幕）、`promo/agentzero_combo_en.mp4`（英文字幕），1080p30，**1 分 17 秒**；
 另有 720p 版 `agentzero_combo_{zh,en}_720p.mp4`。独立字幕 `agentzero_combo_{zh,en}.srt`。一键重剪 `build_combo.sh`。
-配乐 `combo_bgm.wav`：`make_bgm.py --cheer` 程序合成（大调、120 bpm、合成鼓点，无版权）。
+配乐 `combo_bgm.wav`：`make_disco.py` 程序合成的迷幻迪厅风（126 bpm 四踩底鼓、反拍踩镲、滚动锯齿贝斯+谐振滤波扫频、E 小调失谐锯齿铺底、酸性琶音、侧链抽吸、乒乓延迟；纯 numpy/scipy，无版权）。
 
 **全部画面为吴总手机实拍的真机**（2026-10-21 定版：不用 QEMU 素材，去掉"人脸+线虫脑"段）。
 
