@@ -28,6 +28,17 @@ import time
 PORT = 50000
 
 
+def _pad(payload):
+    """Never send a 1-byte datagram. The old Asus's PXE ROM (AR8131 UNDI) silently
+    drops UDP packets whose payload is exactly 1 byte - UDP_READ never returns them
+    to the kernel - while 2+ bytes (even 'C\\0') arrive fine. That is why the 1-byte
+    commands (C F T ? Q X R) looked like a dead link on real metal while longer ones
+    worked. A trailing NUL is invisible to the kernel (C-string terminated)."""
+    if isinstance(payload, str):
+        payload = payload.encode()
+    return payload + b"\0" if len(payload) < 2 else payload
+
+
 class HW:
     def __init__(self, ip="127.0.0.1", port=None, timeout=2.5):
         # AGENTZERO_PORT lets a second kernel instance (e.g. a test QEMU on a
@@ -49,7 +60,7 @@ class HW:
             self.s.setblocking(True)
             self.s.settimeout(self.timeout)
             try:
-                self.s.sendto(cmd.encode(), (self.ip, self.port))
+                self.s.sendto(_pad(cmd), (self.ip, self.port))
                 data, _ = self.s.recvfrom(4096)
                 return data.decode("latin1")
             except socket.timeout:
@@ -149,7 +160,7 @@ class HW:
             self.s.setblocking(True)
             self.s.settimeout(self.timeout)
             try:
-                self.s.sendto(payload, (self.ip, self.port))
+                self.s.sendto(_pad(payload), (self.ip, self.port))
                 data, _ = self.s.recvfrom(4096)
                 return data
             except socket.timeout:
@@ -210,8 +221,7 @@ class HW:
         send each a few times. They are idempotent (overwrite the same cells)."""
         for _ in range(repeat):
             try:
-                self.s.sendto(payload if isinstance(payload, bytes) else payload.encode(),
-                              (self.ip, self.port))
+                self.s.sendto(_pad(payload), (self.ip, self.port))
             except OSError:
                 pass
             time.sleep(0.02)
