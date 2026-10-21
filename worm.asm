@@ -25,13 +25,13 @@ DISH_CY     equ 400
 DISH_R      equ 340
 FOOD_R      equ 180
 FOOD_R2     equ FOOD_R * FOOD_R
-EAT_R       equ 14
+EAT_R       equ 24
 TOUCH_FRAMES equ 90                ; brain steps (2 per frame): a poke-and-hold of 0.75 s
 TOUCH_EXT   equ 300
 CHEMO_GAIN  equ 12
 SWING_AMP   equ 46
-SWING_RATE  equ 6
-SPEED_MAX   equ 2
+SWING_RATE  equ 6                  ; phase advance per px of travel
+SPEED_MAX   equ 4                  ; speed unit = 1/4 px per frame -> max 1 px/frame (60 px/s)
 SPEED_SHIFT equ 5                  ; spd = drive >> 5, clamped to +-SPEED_MAX
 DRIVE_SHIFT equ 4
 OMEGA_TURN  equ 40
@@ -532,8 +532,9 @@ worm_move:
     jge .ab
     neg ebx
 .ab:
-    mov [w_d], ebx                 ; d = |spd|
+    mov [w_d], ebx                 ; d = |spd| (quarter px)
     imul ebx, SWING_RATE
+    shr ebx, 2                     ; phase advance per px
     add ebx, [w_phase]
     and ebx, 255
     mov [w_phase], ebx
@@ -565,13 +566,13 @@ worm_move:
     mov [w_ang], eax
     call cos_q14
     imul eax, [w_d]
-    sar eax, 6
+    sar eax, 8                     ; quarter px * Q14 cos -> Q8 px
     mov ebx, [w_lead]
     add [wx + ebx*4], eax
     mov eax, [w_ang]
     call sin_q14
     imul eax, [w_d]
-    sar eax, 6
+    sar eax, 8
     add [wy + ebx*4], eax
     ; follow the leader
     mov esi, [w_lead]

@@ -27,7 +27,7 @@ SEG = 9                 # px between body points
 W, H = 1024, 768
 DISH_CX, DISH_CY, DISH_R = 400, 400, 340      # petri dish (the right side holds the raster)
 FOOD_R = 180            # food glow radius (px)
-EAT_R = 14
+EAT_R = 24
 TOUCH_FRAMES = 90
 TOUCH_EXT = 300
 CHEMO_GAIN = 12         # ext per unit of concentration change (8x oversampled, 0..255 scale)
@@ -36,7 +36,7 @@ OMEGA_MIN_BACK = 16     # a reversal shorter than this (frames) ends without an 
 OMEGA_TURN = 40         # heading change (angle units, 256 = 360 deg) when forward resumes after a reversal
 SWING_AMP = 46          # head swing amplitude, degrees (Q8 angle units: 256 = 360 deg)
 SWING_RATE = 6          # phase advance per px of travel (angle units)
-SPEED_MAX = 2
+SPEED_MAX = 4           # speed unit = 1/4 px per frame -> max 1 px/frame
 SPEED_SHIFT = 5
 DRIVE_SHIFT = 4
 TURN_GAIN = 3           # heading change per frame = bend * gain >> 10
@@ -168,7 +168,7 @@ class Worm:
         self.was_back = 1 if spd < 0 else 0
         if spd < 0:
             self.back_frames += 1
-        self.phase = (self.phase + abs(spd) * SWING_RATE) & 255
+        self.phase = (self.phase + ((abs(spd) * SWING_RATE) >> 2)) & 255
         swing = (SWING_AMP * sin_q14(self.phase)) >> 14
         if spd > 0:
             lead, nxt, step = 0, 1, 1
@@ -179,8 +179,8 @@ class Worm:
             tx = self.x[NSEG - 1] - self.x[NSEG - 2]; ty = self.y[NSEG - 1] - self.y[NSEG - 2]
             ang = (iatan2(ty, tx) + swing) & 255
         d = abs(spd)
-        self.x[lead] += (d * cos_q14(ang)) >> 6       # Q8 px: d*cos (Q14) >> 6
-        self.y[lead] += (d * sin_q14(ang)) >> 6
+        self.x[lead] += (d * cos_q14(ang)) >> 8       # quarter px * Q14 -> Q8 px
+        self.y[lead] += (d * sin_q14(ang)) >> 8
         # follow the leader: each point stays SEG px from the previous one
         i = nxt
         while 0 <= i < NSEG:
