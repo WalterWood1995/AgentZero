@@ -40,7 +40,7 @@ def _sock():
 def query_geometry(sock, ip):
     """Ask the kernel for its real framebuffer geometry; fall back to defaults."""
     try:
-        sock.sendto(b"Q", (ip, PORT))
+        sock.sendto(b"Q\0", (ip, PORT))     # never a 1-byte datagram: the Asus PXE ROM drops those
         for _ in range(3):
             try:
                 data, _ = sock.recvfrom(64)
@@ -56,13 +56,14 @@ def query_geometry(sock, ip):
 
 
 def enter_graphics(sock, ip, tries=8):
-    """Switch to graphics mode. V is a single packet and the real-HW channel drops
-    packets, so send it several times (gfx_enter is idempotent); if even one V is
-    lost the kernel would ignore every following G. Collect the ack byte if any."""
+    """Switch to graphics mode. Sent several times (gfx_enter is idempotent) in case a
+    packet is lost - if even one V is lost the kernel would ignore every following G.
+    Padded to 2 bytes: the Asus PXE ROM never delivers a 1-byte UDP payload, which is
+    what made "V" look lossy on real metal. Collect the ack byte if any."""
     acked = None
     for _ in range(tries):
         try:
-            sock.sendto(b"V", (ip, PORT))
+            sock.sendto(b"V\0", (ip, PORT))
             data, _ = sock.recvfrom(16)
             if data:
                 acked = data[0]
@@ -76,7 +77,7 @@ def exit_graphics(sock, ip):
     """Send U (back to text mode + face). Fire-and-forget, with redundancy."""
     for _ in range(3):
         try:
-            sock.sendto(b"U", (ip, PORT))
+            sock.sendto(b"U\0", (ip, PORT))     # padded: 1-byte datagrams never arrive
         except OSError:
             pass
         time.sleep(0.05)

@@ -940,7 +940,8 @@ net_loop:
     jmp .poll
 .do_gfxon:                         ; V: (graphics console is always on) - just ack
     mov byte [tx_buf], 1
-    mov word [tx_len], 1
+    mov byte [tx_buf+1], 0         ; 2-byte ack: the Asus PXE ROM never transmits (or
+    mov word [tx_len], 2           ; delivers) a 1-byte UDP payload, so a 1-byte ack is lost
     jmp .reply
 .do_gfxoff:                        ; U: drop any full-screen image, repaint the text/face
     mov byte [gfx_mode], 0
@@ -1082,7 +1083,8 @@ net_loop:
     lea esi, [rx_buf+9]
     rep movsb
     mov byte [tx_buf], 'L'
-    mov word [tx_len], 1
+    mov byte [tx_buf+1], 0         ; 2-byte ack (1-byte UDP payloads never leave the ROM)
+    mov word [tx_len], 2
     jmp .reply
 %ifdef HAVE_BRAIN
 .do_brain:
