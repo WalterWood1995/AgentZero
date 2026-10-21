@@ -18,8 +18,10 @@ ORG 0x7C00
 STAGE2_BYTES equ 42 * 512           ; native build: larger stage2 (e1000/AR8131 driver + IP/UDP)
 %elifdef ARCADE
 STAGE2_BYTES equ 48 * 512           ; arcade build: + game console
+%elifdef WORM
+STAGE2_BYTES equ 80 * 512           ; worm build: + petri dish + brain image
 %else
-STAGE2_BYTES equ 36 * 512           ; stage2 is padded to 36 sectors (must match stage1/stage2)
+STAGE2_BYTES equ 40 * 512           ; stage2 is padded to 40 sectors (must match stage1/stage2)
 %endif
 
 ; Scratch block at physical 0x5000 (free low memory) hands the PXE entry info to
@@ -49,13 +51,22 @@ start:
     mov sp, 0x7C00
     cld
 
-    ; backward copy stage2: 0x7E00 -> 0x8000, STAGE2_BYTES bytes (word at a time)
+    ; backward copy stage2: 0x7E00 -> 0x8000, STAGE2_BYTES bytes (word at a time).
+    ; Source/destination are addressed through their own segments (0x07E0 / 0x0800)
+    ; so a stage2 larger than 32 KiB (offsets past 0xFFFF) still copies correctly.
+    mov ax, 0x07E0
+    mov ds, ax
+    mov ax, 0x0800
+    mov es, ax
     std
-    mov si, 0x7E00 + STAGE2_BYTES - 2
-    mov di, 0x8000 + STAGE2_BYTES - 2
+    mov si, STAGE2_BYTES - 2
+    mov di, STAGE2_BYTES - 2
     mov cx, STAGE2_BYTES / 2
     rep movsw
     cld
+    xor ax, ax
+    mov ds, ax
+    mov es, ax
 
     jmp 0x0000:0x8000
 

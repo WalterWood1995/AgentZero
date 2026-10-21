@@ -43,8 +43,18 @@ FRAME_COUNTS equ 29800             ; PIT ch0 counts per frame (~25 ms, CPU-indep
 STAGE2_SECTORS equ 42              ; native build is larger (e1000/AR8131 driver + IP/UDP)
 %elifdef ARCADE
 STAGE2_SECTORS equ 48              ; arcade build: + game console (arcade.asm)
+%elifdef WORM
+STAGE2_SECTORS equ 80              ; worm build: + petri dish (worm.asm) + the brain image (>64 sectors: loaders copy/read in two segments)
 %else
-STAGE2_SECTORS equ 36              ; must match stage1.asm / pxe_stage1.asm (sector budget)
+STAGE2_SECTORS equ 40              ; must match stage1.asm / pxe_stage1.asm (sector budget)
+%endif
+; The C. elegans brain primitive (brain.asm + the UDP 'n' command) is built into the
+; default and WORM kernels. The native-NIC and arcade builds are at their sector
+; budget, so they leave it out for now (bump their budget to add it).
+%ifndef NIC_NATIVE
+%ifndef ARCADE
+%define HAVE_BRAIN
+%endif
 %endif
 ; --- Fourier "epicycle" compute (the old PC's CPU does the real fixed-point maths) ---
 ; The Agent preloads, into free high RAM (not part of the kernel image), a small
@@ -85,6 +95,9 @@ stage2:
     ; ---- arcade: straight into the VBE framebuffer (game console). Grab the ROM
     ; 8x8 font first (text mode is still up) for on-screen score/text. ----
     call extract_font
+    call vbe_setup
+%elifdef WORM
+    call extract_font              ; worm: same boot path as the arcade (font + VBE)
     call vbe_setup
 %else
     call pit_init16                ; PIT ch0 timebase for the opening animation
@@ -542,6 +555,9 @@ pm_entry:
 %ifdef ARCADE
     jmp arcade_pm                  ; game console: fixed-rate input->update->render loop
 %endif
+%ifdef WORM
+    jmp worm_pm                    ; petri dish: C. elegans brain + body, 60 fps
+%endif
     call pit_init                  ; free-running PIT ch0 timebase (QEMU==real HW)
     call uart_detect               ; is COM1 real? (K50IJ has no serial port)
     ; The opening animation already drew the face in real mode. Here we only do
@@ -683,6 +699,58 @@ net_loop:
     call send_question
 %endif
     mov dword [kbd_len], 0
+%ifdef BLACKBOX_TEST
+    ; --- RAM black-box survival self-test (method 1, phase 0 verification) ---
+    ; At boot (reliable UDP window), report the persisted magic+count at 0x70000,
+    ; then write a fresh magic+count, set the BIOS warm-boot flag, and 8042-reset.
+    ; If RAM survives the warm reset, the dev PC sees the count climb 1->2->3 across
+    ; boots; if it is cleared, the count never sticks. Stops looping after count 3.
+    ; report 3 candidate slots' magics (low 0x70000, mid 0x800000=8MB, high
+    ; 0x4000000=64MB) + the count, to find which survives the warm reset.
+    mov eax, [0x00070000]
+    mov [kbd_buf + 0], eax
+    mov eax, [0x00800000]
+    mov [kbd_buf + 4], eax
+    mov eax, [0x04000000]
+    mov [kbd_buf + 8], eax
+    mov eax, [0x00800004]              ; count (kept in the 8MB slot)
+    mov [kbd_buf + 12], eax
+    mov dword [kbd_len], 16
+    call send_question                 ; boot-time burst (this window is reliable)
+    call send_question
+    call send_question
+    call send_question
+    call send_question
+    mov dword [kbd_len], 0
+    mov eax, [0x00800000]
+    cmp eax, 0xB10CB0C5                ; magic from a previous boot (8MB slot)?
+    jne .bb_first
+    mov eax, [0x00800004]
+    cmp eax, 3
+    jae .bb_done                      ; looped enough -> fall through to normal net_loop
+    inc eax
+    mov [0x00070004], eax
+    mov [0x00800004], eax             ; count++ in all slots
+    mov [0x04000004], eax
+    jmp .bb_reboot
+.bb_first:
+    mov dword [0x00070000], 0xB10CB0C5
+    mov dword [0x00800000], 0xB10CB0C5
+    mov dword [0x04000000], 0xB10CB0C5
+    mov dword [0x00070004], 1
+    mov dword [0x00800004], 1
+    mov dword [0x04000004], 1
+.bb_reboot:
+    mov word [0x00000472], 0x1234     ; BIOS warm-boot flag: skip POST memory test
+    mov ecx, 0x08000000               ; let the UDP bursts flush before the reset
+.bb_d: dec ecx
+    jnz .bb_d
+    mov al, 0xFE
+    out 0x64, al                      ; 8042 CPU reset -> re-PXE-boot
+    cli
+    hlt
+.bb_done:
+%endif
 .poll:
 %ifdef NIC_AR8131
     call ar_hud                    ; live NIC diagnostics on the bottom text row
@@ -755,6 +823,10 @@ net_loop:
     je  .do_reboot
     cmp byte [rx_buf], 'N'         ; N<text> = inject keystrokes (type; \r = Enter)
     je  .do_keys
+%ifdef HAVE_BRAIN
+    cmp byte [rx_buf], 'n'         ; n = C. elegans brain primitive (nI init, nM mode, nS steps)
+    je  .do_brain
+%endif
     ; copy rx_buf -> line_buf up to CR/LF/limit (single-line commands)
     xor esi, esi
 .cp:
@@ -1012,6 +1084,78 @@ net_loop:
     mov byte [tx_buf], 'L'
     mov word [tx_len], 1
     jmp .reply
+%ifdef HAVE_BRAIN
+.do_brain:
+    ; nI            -> expand the CSR blob the host loaded at BR_BLOB; reply "nI"+nsyn(u16)
+    ; nM<1hex>      -> 0 = SSE2 dense path, 1 = scalar sparse path; reply "nM"
+    ; nS<4hex k>    -> run k steps with the current EXT (host loads it at BR_EXT with L);
+    ;                  reply v int16[NR] + spike bitmap (NR/8 bytes) + gi int16
+    mov word [tx_len], 0
+    mov al, [rx_buf+1]
+    cmp al, 'I'
+    je  .br_init
+    cmp al, 'M'
+    je  .br_mode
+    cmp al, 'S'
+    je  .br_steps
+    jmp .poll
+.br_init:
+    mov esi, BR_BLOB
+    call brain_init
+    test eax, eax
+    jz  .poll
+    mov word [tx_buf], 'nI'        ; NASM char constants are little-endian: bytes "nI"
+    mov eax, [br_nsyn]
+    mov [tx_buf+2], ax
+    mov word [tx_len], 4
+    jmp .reply
+.br_mode:
+    mov al, [rx_buf+2]
+    call hexval
+    and al, 1
+    mov [br_mode], al
+    mov word [tx_buf], 'nM'
+    mov word [tx_len], 2
+    jmp .reply
+.br_steps:
+    cmp byte [br_ready], 0
+    je  .poll
+    mov dword [parse_ptr], rx_buf + 2
+    mov bl, 4
+    call phex
+    mov ecx, eax
+.br_sl:
+    test ecx, ecx
+    jz  .br_sd
+    call brain_step
+    dec ecx
+    jmp .br_sl
+.br_sd:
+    mov esi, BR_V
+    mov edi, tx_buf
+    mov ecx, BR_NR / 2
+    rep movsd                      ; v[] (800 B)
+    xor ebx, ebx                   ; spike bitmap: bit = s[row] != 0
+.br_bm:
+    xor al, al
+    mov ecx, 8
+.br_bb:
+    shr al, 1
+    cmp word [BR_S+ebx*2], 0
+    je  .br_b0
+    or  al, 0x80
+.br_b0:
+    inc ebx
+    dec ecx
+    jnz .br_bb
+    stosb
+    cmp ebx, BR_NR
+    jb  .br_bm
+    mov eax, [br_gi]
+    stosw
+    mov word [tx_len], BR_NR*2 + BR_NR/8 + 2
+    jmp .reply
+%endif
 .do_epi:
     ; E<4hex t> -> evaluate the preloaded Fourier series at time step t, in fixed point,
     ; and reply the (N+1) accumulated points (the chain of epicycle centres ending at the
@@ -2982,7 +3126,8 @@ s_unknown db " ?",13,10,0
 s_help    db "C=cpuid-vendor F=cpuid-leaf1 I<4hex>=inb T=rtc M<8hex><2hex>=mem "
           db "P<bb><dd><f><oo>=pci O<pppp><vv>!=outb(gated) "
           db "W<aaaaaaaa><dddddddd>!=mem/mmio-dword(gated) "
-          db "A<op><aaaaaaaa><bbbbbbbb>=alu L<addr><raw>=load E<tttt>=fourier ?=help",13,10,0
+          db "A<op><aaaaaaaa><bbbbbbbb>=alu L<addr><raw>=load E<tttt>=fourier "
+          db "nI/nM<m>/nS<kkkk>=worm-brain(udp) ?=help",13,10,0
 s_wok     db "write ok",13,10,0
 s_wabort  db "write aborted (need '!')",13,10,0
 s_pcihdr  db "== PCI scan  bus:dev.fn  vendor:device  class ==",13,10,0
@@ -3130,9 +3275,16 @@ BITS 32
 %endif
 %endif
 %include "face_data.inc"            ; Dario portrait baked into the kernel
-%ifdef ARCADE
 BITS 32
+%ifdef HAVE_BRAIN
+%include "brain.asm"                ; C. elegans brain primitive (SSE2 LIF step)
+%endif
+%ifdef ARCADE
 %include "arcade.asm"               ; game console: PS/2 input + frame loop + Pong + Fight
+%endif
+%ifdef WORM
+%include "worm.asm"                 ; petri dish: body, food, raster, HUD (uses brain.asm)
+%include "worm/data/brain.inc"      ; the connectome image (worm/connectome.py)
 %endif
 
     times (STAGE2_SECTORS*512)-($-$$) db 0

@@ -210,6 +210,30 @@ This lives in `organism/` — the self-organising "cell" structure (see `organis
 (`cpu_math_answer.py`, `fourier_dario.py`), and `knowledge/` holds what each cell learned
 (`cpu-alu.md`, `fourier-epicycles.md`).
 
+## A whole animal brain on the dead laptop: C. elegans
+
+`WORM=1 bash build.sh` builds the petri-dish kernel (`pxe_worm.img` / `disk_worm.img`):
+the 302-neuron *C. elegans* connectome (OpenWorm tables, MIT; see
+[worm/data/SOURCES.md](worm/data/SOURCES.md)) runs on the old PC's CPU as a fixed-point
+integrate-and-fire network (int16, SSE2 `pmaddwd`, two brain steps per 60 fps frame) and
+drives a virtual worm: B-class vs A-class motor neuron spikes set forward/backward motion,
+anterior touch (`H`, or the dish wall) reaches ALM/AVM and the worm reverses, posterior
+touch (`T`) reaches PLM and it surges forward, and the food glow is sensed through
+ASEL/ASER (`F` drops food ahead, the worm crawls into it). The right-hand panel is the live
+state of all 302 neurons plus the 24 dorsal/ventral body-wall muscles - a real simulation
+state, not an animation. No OS, and the network is not touched after boot.
+
+![C. elegans dish](docs/images/worm-dish.png)
+
+The dynamics are a qualitative cartoon (synaptic normalisation, spike-frequency adaptation,
+global inhibition, plus three documented modelling assumptions on the touch and pirouette
+circuits), not a biophysical model; the body wave is a kinematic chain driven by the brain's
+motor output. `worm/wormsim.py` is the bit-exact Python reference of the kernel's brain
+step, and `worm/brain_qemu_test.py` proves it: the kernel's SSE2 dense path and scalar
+sparse path both match it with maxdiff = 0 over hundreds of steps (via the UDP `n` command
+on the default kernel). `worm/worm_qemu_test.py` is the unattended behaviour test
+(reversal, forward surge, food reached) and records frame sequences for a demo video.
+
 ## Build
 
 Needs [NASM](https://www.nasm.us/). Point to it with `NASM=` or have `nasm` on `PATH`:

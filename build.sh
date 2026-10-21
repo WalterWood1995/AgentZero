@@ -35,11 +35,23 @@ if [ -n "${ARCADE:-}" ]; then
     DEFS="-dARCADE"
     echo "building ARCADE (game console) kernel"
 fi
+# WORM=1 builds the C. elegans petri-dish kernel (worm.asm + brain.asm + the
+# connectome image). It is written to disk_worm.img / pxe_worm.img so the images
+# the PXE server is serving (pxe.img) are never overwritten by accident.
+# OUT=<name> writes any build to disk_<name>.img / pxe_<name>.img instead.
+OUT="${OUT:-}"
+if [ -n "${WORM:-}" ]; then
+    DEFS="-dWORM"
+    OUT="${OUT:-worm}"
+    echo "building WORM (C. elegans petri dish) kernel"
+fi
+DISK="disk${OUT:+_$OUT}.img"
+PXE="pxe${OUT:+_$OUT}.img"
 
 "$NASM" -f bin $DEFS "$SRC/stage1.asm" -o "$SRC/stage1.bin"
 "$NASM" -f bin $S2DEF $DEFS "$SRC/stage2.asm" -o "$SRC/stage2.bin"
 "$NASM" -f bin $DEFS "$SRC/pxe_stage1.asm" -o "$SRC/pxe_stage1.bin"
-cat "$HERE/stage1.bin" "$HERE/stage2.bin" > "$HERE/disk.img"          # USB / raw disk
-cat "$HERE/pxe_stage1.bin" "$HERE/stage2.bin" > "$HERE/pxe.img"       # PXE network boot
-echo "disk.img: $(stat -c %s "$HERE/disk.img") bytes ($(( $(stat -c %s "$HERE/disk.img") / 512 )) sectors)"
-echo "pxe.img:  $(stat -c %s "$HERE/pxe.img") bytes"
+cat "$HERE/stage1.bin" "$HERE/stage2.bin" > "$HERE/$DISK"          # USB / raw disk
+cat "$HERE/pxe_stage1.bin" "$HERE/stage2.bin" > "$HERE/$PXE"       # PXE network boot
+echo "$DISK: $(stat -c %s "$HERE/$DISK") bytes ($(( $(stat -c %s "$HERE/$DISK") / 512 )) sectors)"
+echo "$PXE:  $(stat -c %s "$HERE/$PXE") bytes"

@@ -16,8 +16,10 @@ STAGE2_OFF equ 0x8000
 STAGE2_SECTORS equ 40          ; native NIC build (must match stage2.asm)
 %elifdef ARCADE
 STAGE2_SECTORS equ 48          ; arcade build (must match stage2.asm)
+%elifdef WORM
+STAGE2_SECTORS equ 80          ; worm build (must match stage2.asm)
 %else
-STAGE2_SECTORS equ 36          ; must match stage2.asm / pxe_stage1.asm (sector budget)
+STAGE2_SECTORS equ 40          ; must match stage2.asm / pxe_stage1.asm (sector budget)
 %endif
 STAGE2_LBA equ 1               ; stage2 starts right after this boot sector
 
@@ -44,7 +46,17 @@ start:
     mov ah, 0x42
     mov dl, [drive]
     int 0x13
-    jnc stage2_ok
+    jc  .chs
+%if STAGE2_SECTORS > 63
+    ; the rest would cross the 64 KiB boundary at 0x10000 (many BIOSes refuse a
+    ; transfer across it): read it with a second packet into segment 0x0FE0
+    mov si, dap2
+    mov ah, 0x42
+    mov dl, [drive]
+    int 0x13
+    jc  .chs
+%endif
+    jmp stage2_ok
     ; fall through to CHS on error
 
 .chs:
@@ -78,13 +90,27 @@ disk_err:
 
 ; Disk Address Packet for the LBA extended read.
 align 4
+%if STAGE2_SECTORS > 63
+FIRST_SECTORS equ 63           ; 0x8000 + 63*512 = 0xFE00: last read that stays below 0x10000
+%else
+FIRST_SECTORS equ STAGE2_SECTORS
+%endif
 dap:
     db 0x10                    ; packet size
     db 0                       ; reserved
-    dw STAGE2_SECTORS          ; sectors to transfer
+    dw FIRST_SECTORS           ; sectors to transfer
     dw STAGE2_OFF              ; buffer offset
     dw STAGE2_SEG              ; buffer segment
     dq STAGE2_LBA              ; starting LBA
+%if STAGE2_SECTORS > 63
+dap2:
+    db 0x10
+    db 0
+    dw STAGE2_SECTORS - FIRST_SECTORS
+    dw 0x0000                  ; buffer 0x0FE0:0000 = linear 0xFE00
+    dw 0x0FE0
+    dq STAGE2_LBA + FIRST_SECTORS
+%endif
 
 err   db "stage1: disk read error", 0
 drive db 0
