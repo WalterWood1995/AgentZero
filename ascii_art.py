@@ -12,7 +12,8 @@ RAMP = " .:-=+*#%@"                            # 10 levels: space(dark) -> @(bri
 def render(src, W=40, invert=False, rows=50, aspect=1.0):
     # aspect = char cell height/width. VGA 80x50 cells are ~square (~1.0); a tall
     # terminal font would be ~0.5. W is kept small so a portrait is not squashed.
-    img = Image.open(src).convert("L")
+    # src = path or a PIL Image (ascii_cam feeds live camera frames)
+    img = (src if isinstance(src, Image.Image) else Image.open(src)).convert("L")
     img = ImageOps.autocontrast(img, cutoff=3)
     img = ImageEnhance.Contrast(img).enhance(1.6)
     if invert:

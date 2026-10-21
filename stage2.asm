@@ -813,6 +813,10 @@ net_loop:
     je  .do_qgeo
     cmp byte [rx_buf], 'B'         ; block write (multi-line) parsed from rx_buf
     je  .do_block
+    cmp byte [rx_buf], 'b'         ; b = block write WITHOUT repaint (assemble a frame; the
+    je  .do_block_q               ;     last packet of the frame is a 'B' -> one repaint)
+    cmp byte [rx_buf], 'g'         ; g = raw 8-bit grey rows -> THIS CPU maps brightness to
+    je  .do_gray                   ;     ramp chars + 3 attributes (ascii_cam --kernel-render)
     cmp byte [rx_buf], 'L'         ; L = bulk-load raw bytes into the compute scratch RAM
     je  .do_load
     cmp byte [rx_buf], 'E'         ; E = evaluate the Fourier epicycle chain at a time step
@@ -903,6 +907,13 @@ net_loop:
     ; B<2hex startrow> then newline-separated lines -> write each at (row+i, 0).
     ; One packet carries many rows, so the whole face is ~3 packets not ~50.
     ; Idempotent (overwrites same cells), fire-and-forget (no ack).
+    ; Bytes 0x01/0x02/0x03 inside a line switch the attribute (dim green / bright
+    ; green / white) for the following cells; the block ends with the normal attr.
+    mov byte [blk_pres], 1
+    jmp .do_block_c
+.do_block_q:                       ; b: same, but no repaint (ascii_cam frame parts)
+    mov byte [blk_pres], 0
+.do_block_c:
     mov byte [rain_on], 0
     mov dword [parse_ptr], rx_buf + 1
     mov bl, 2
@@ -928,6 +939,14 @@ net_loop:
     jz  .blk_done
     cmp al, 10
     je  .blk_eol
+    cmp al, 4
+    jae .blk_put
+    movzx eax, al                  ; 1/2/3 -> attribute table (dim / bright / white)
+    mov al, [attr_tab + eax]
+    mov [cur_attr], al
+    inc esi
+    jmp .blk_wr
+.blk_put:
     call vga_putc
     inc esi
     jmp .blk_wr
@@ -936,7 +955,47 @@ net_loop:
     inc dword [blk_row]
     jmp .blk_line
 .blk_done:
+    mov byte [cur_attr], VGA_ATTR  ; chat/face text after the block stays normal green
+    cmp byte [blk_pres], 0
+    je  .poll                      ; 'b': frame not complete yet, no repaint
     mov byte [need_present], 1     ; repaint the console with the new block of text
+    jmp .poll
+.do_gray:
+    ; g<2hex row><1hex repaint><raw grey bytes, 80 per row>: the old PC renders the
+    ; picture itself - each byte -> one of 10 ramp chars (" .:-=+*#%@") and dim /
+    ; bright / white by brightness. One row = 80 bytes, so a packet carries whole rows.
+    mov byte [rain_on], 0
+    mov dword [parse_ptr], rx_buf + 1
+    mov bl, 2
+    call phex                      ; start row (phex keeps ecx = packet length)
+    and eax, 0x7F
+    imul edi, eax, 80
+    shl edi, 1
+    add edi, VGA                   ; cell pointer at (row, col 0)
+    mov bl, 1
+    call phex                      ; repaint flag 0/1
+    and al, 1
+    mov [blk_pres], al
+    mov esi, [parse_ptr]           ; first grey byte
+    lea edx, [rx_buf + ecx]        ; end of packet
+.gr_loop:
+    cmp esi, edx
+    jae .gr_done
+    cmp edi, VGA + SCR_CELLS * 2
+    jae .gr_done                   ; never past the text buffer
+    movzx eax, byte [esi]
+    imul eax, eax, 10
+    shr eax, 8                     ; 0..9 ramp index
+    mov bl, [gray_ramp + eax]
+    mov bh, [gray_attr + eax]
+    mov [edi], bx                  ; char + attribute cell
+    add edi, 2
+    inc esi
+    jmp .gr_loop
+.gr_done:
+    cmp byte [blk_pres], 0
+    je  .poll
+    mov byte [need_present], 1
     jmp .poll
 .do_gfxon:                         ; V: (graphics console is always on) - just ack
     mov byte [tx_buf], 1
@@ -2215,7 +2274,7 @@ vga_putc:
     mov ebx, edi
     shl ebx, 1
     add ebx, VGA
-    mov ah, VGA_ATTR
+    mov ah, [cur_attr]
     mov [ebx], ax                  ; al=char, ah=attr
     inc edi
     mov [vga_pos], edi
@@ -3149,6 +3208,11 @@ peer_port dw 0                     ; last command sender's UDP port
 tx_len    dw 0
 align 4
 blk_row   dd 0                     ; current row for B (block) writes
+blk_pres  db 1                     ; 1 = repaint after this block (B), 0 = defer (b)
+cur_attr  db VGA_ATTR              ; attribute vga_putc writes (block ctrl bytes change it)
+attr_tab  db VGA_ATTR, 0x02, 0x0A, 0x0F   ; ctrl byte 0(unused)/1 dim/2 bright/3 white
+gray_ramp db " .:-=+*#%@"              ; g command: brightness -> char (same ramp as ascii_art.py)
+gray_attr db 0x02,0x02,0x02,0x02,0x0A,0x0A,0x0A,0x0F,0x0F,0x0F   ; dim / bright / white tiers
 rx_buf    times 1536 db 0          ; received command packet (fits a full 1472-byte UDP read)
 tx_buf    times 1536 db 0          ; reply payload (fits a 301-point Fourier reply, 1204B)
 kbd_len   dd 0

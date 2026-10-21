@@ -26,9 +26,11 @@ except Exception as _e:                            # keep chat working even if t
     print("image display unavailable (%r)" % _e, flush=True)
 
 Q_PORT = 50001          # we listen here (questions from the old PC)
+CHAT_ROW0 = int(os.environ.get("CHAT_ROW0", "0"))   # first screen row of the dialogue pane
+                        # (ascii_cam --layout dual: CHAT_ROW0=38 CHAT_PANE_H=10 puts it under your portrait)
 R_PORT = 50000          # kernel listens here (display commands)
 LEFT_W = 38             # left dialogue column width (face is on the right)
-PANE_H = 14             # left dialogue height: pad every reply to this many rows so a
+PANE_H = int(os.environ.get("CHAT_PANE_H", "14"))   # left dialogue height: pad every reply to this many rows so a
                         # shorter answer fully clears the previous one (stays < the
                         # kernel's 760-byte UDP read buffer: 14*41 + 4 ~= 578 bytes)
 
@@ -234,7 +236,7 @@ def _send_text(sock, peer, a, q=None):
     lines = lines[:PANE_H]
     while len(lines) < PANE_H:
         lines.append("")
-    payload = "B00\n" + "\n".join(l.ljust(40)[:40] for l in lines)
+    payload = "B%02X\n" % CHAT_ROW0 + "\n".join(l.ljust(40)[:40] for l in lines)
     for _ in range(4):
         sock.sendto(payload.encode("latin1"), (peer, R_PORT))
 
