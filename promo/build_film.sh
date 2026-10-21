@@ -37,3 +37,7 @@ for L in zh en; do
   ffprobe -v error -show_entries format=duration -of csv=p=0 film_$L.mp4
 done
 ls -la "$BM/promo/worm_film_"*
+# ---- audio: drop the phone sound, lay the synthesized background music under everything ----
+for L in zh en; do
+  ffmpeg -v error -y -i "$BM/promo/worm_film_$L.mp4" -i "$BM/promo/worm_bgm.wav" -map 0:v -map 1:a -c:v copy -c:a aac -b:a 128k -ac 2 -shortest -movflags +faststart "$BM/promo/tmp_$L.mp4" && mv "$BM/promo/tmp_$L.mp4" "$BM/promo/worm_film_$L.mp4"
+done

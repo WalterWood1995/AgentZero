@@ -2,7 +2,8 @@
 
 成片：`promo/worm_film_zh.mp4`（中文字幕）、`promo/worm_film_en.mp4`（英文字幕），约 1 分 35 秒，1080p30。
 字幕文件：`worm_film_zh.srt` / `worm_film_en.srt`（可直接上传平台做可开关字幕）。
-结构：片头字卡 5 s → 手机实拍真机 41 s（保留现场声）→ QEMU 无人演示 43 s（同一内核）→ 片尾 5 s。
+结构：片头字卡 5 s → 手机实拍真机 41 s → QEMU 无人演示 43 s（同一内核）→ 片尾 5 s。
+音轨：原声已去掉，背景音乐 `worm_bgm.wav` 为程序合成的环境电子乐（numpy 生成，Am-F-C-G 铺底+琶音，无版权问题），由 `build_film.sh` 末尾替换音轨。
 
 ---
 
