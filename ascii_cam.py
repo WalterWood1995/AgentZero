@@ -225,8 +225,13 @@ class Screen:
         """Kernel-render mode: g<row><repaint flag><raw bytes, SCR_COLS per row> (table
         lookup on the old PC) or, with cmd=b"i", the old PC's neural network (--nn)."""
         rows, cols = cells.shape
-        full = np.zeros((rows, SCR_COLS), dtype=np.uint8)
-        full[:, col0:col0 + cols] = cells
+        if cmd == b"i":                              # the net renders ALL rows: send the whole
+            full = np.zeros((SCR_ROWS, SCR_COLS), dtype=np.uint8)   # grid so no row is stale RAM
+            full[row0:row0 + rows, col0:col0 + cols] = cells
+            rows, row0 = SCR_ROWS, 0
+        else:
+            full = np.zeros((rows, SCR_COLS), dtype=np.uint8)
+            full[:, col0:col0 + cols] = cells
         rpp = max(1, min(self.rpp, (self.max_packet - 4) // SCR_COLS))
         parts = list(range(0, rows, rpp))
         for i, r in enumerate(parts):
