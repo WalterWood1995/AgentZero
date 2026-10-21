@@ -13,13 +13,23 @@ s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.settimeout(1.0)
 t0 = time.time()
 print("waiting for %s (up to %.0f min)..." % (ip, mins), flush=True)
+import struct
 while time.time() - t0 < mins * 60:
     try:
         s.sendto(b"Q\0", (ip, 50000))
         d, _ = s.recvfrom(64)
         if len(d) >= 16:
-            print("kernel up after %.0fs, geometry reply %d B" % (time.time() - t0, len(d)), flush=True)
-            break
+            # is it the 128x96 kernel (pxe_cam.img) or an older 80x50 image still running?
+            # light a cell at row 95 col 126 (only exists on the big grid) and read the pixel back
+            w, h, pitch, bpp = struct.unpack("<4I", d[:16])
+            s.sendto(b"S5F7E@", (ip, 50000)); time.sleep(0.2)
+            off = (95 * 8 + 3) * pitch + (126 * 8 + 1) * 4
+            s.sendto(b"Y%08X%04X" % (off, 16), (ip, 50000))
+            px, _ = s.recvfrom(64)
+            if px[:3] == b"\xff\xff\xff" or px[1] > 0:
+                print("128x96 kernel up after %.0fs" % (time.time() - t0), flush=True)
+                break
+            print("an older (80x50) kernel is answering - waiting for the new image to boot", flush=True)
     except (socket.timeout, OSError):
         pass
     time.sleep(2)

@@ -19,9 +19,9 @@
 #   python ascii_cam.py --once                # render one frame to stdout (no network)
 #   python ascii_cam.py --subtitle            # + mic -> faster-whisper -> caption row
 #
-# Screen layout (80x50 text console, 8x8 cells): portrait COLSxROWS centred at the top
-# (default 64x48 = the camera's 4:3), caption on row 49. Row 49 is never fully written
-# (80 chars on the last row would make the kernel scroll).
+# Screen layout (128x96 text console = the whole 1024x768, 8x8 cells; --screen 80x50 for
+# the older image): portrait COLSxROWS centred at the top (default 120x90 = 4:3), caption
+# on the last row, which is never fully written (a full last row makes the kernel scroll).
 import argparse
 import os
 import socket
@@ -39,7 +39,7 @@ import ascii_art
 HERE = os.path.dirname(os.path.abspath(__file__))
 RAMP = ascii_art.RAMP
 TIER_OF = [1] * 4 + [2] * 3 + [3] * 3          # ramp index -> 1 dim / 2 bright / 3 white
-SUB_ROW = 49
+SCR_COLS, SCR_ROWS = 128, 96                     # the kernel's text console (--screen 80x50 = old image)
 FACE_MODEL = os.path.join(HERE, "organism", "models", "face_landmarker.task")
 
 
@@ -175,9 +175,9 @@ def encode_line(text, tiers, legacy):
 
 # ----------------------------------------------------------------- sender
 class Screen:
-    def __init__(self, ip, port, repeat=1, gap=0.0004, rows_per_packet=8, legacy=False):
+    def __init__(self, ip, port, repeat=1, gap=0.0004, rows_per_packet=8, legacy=False, max_packet=1400):
         self.ip, self.port, self.repeat, self.gap = ip, port, repeat, gap
-        self.rpp, self.legacy = rows_per_packet, legacy
+        self.rpp, self.legacy, self.max_packet = rows_per_packet, legacy, max_packet
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.settimeout(0.3)
         self.pkts = 0
@@ -202,28 +202,36 @@ class Screen:
             time.sleep(0.03)
 
     def frame(self, lines, tiers, col0, row0=0):
-        """Send a whole frame: 'b' parts then a final 'B' (one repaint)."""
+        """Send a whole frame: 'b' parts then a final 'B' (one repaint). Rows are packed
+        greedily so no packet exceeds max_packet bytes (kernel RX 1472; real HW ~700)."""
         pad = " " * col0
-        n = len(lines)
-        parts = list(range(0, n, self.rpp))
-        for i, r in enumerate(parts):
-            last = i == len(parts) - 1
+        enc = [encode_line(pad + ln, [0] * col0 + tl, self.legacy) for ln, tl in zip(lines, tiers)]
+        packets, cur, cur_row, size = [], [], 0, 0
+        for k, e in enumerate(enc):
+            if cur and (size + len(e) + 1 > self.max_packet or len(cur) >= self.rpp):
+                packets.append((cur_row, cur)); cur, size = [], 0
+            if not cur:
+                cur_row, size = k, 4
+            cur.append(e); size += len(e) + 1
+        if cur:
+            packets.append((cur_row, cur))
+        for i, (r, body) in enumerate(packets):
+            last = i == len(packets) - 1
             head = (b"B" if (last or self.legacy) else b"b") + b"%02X\n" % (row0 + r)
-            body = b"\n".join(encode_line(pad + lines[k], [0] * col0 + tiers[k], self.legacy)
-                              for k in range(r, min(n, r + self.rpp)))
-            self.send(head + body)
-        return len(parts)
+            self.send(head + b"\n".join(body))
+        return len(packets)
 
     def gray_frame(self, cells, col0, row0=0):
         """Kernel-render mode: g<row><repaint flag><raw bytes, 80 per row>."""
         rows, cols = cells.shape
-        full = np.zeros((rows, 80), dtype=np.uint8)
+        full = np.zeros((rows, SCR_COLS), dtype=np.uint8)
         full[:, col0:col0 + cols] = cells
-        parts = list(range(0, rows, self.rpp))
+        rpp = max(1, min(self.rpp, (self.max_packet - 4) // SCR_COLS))
+        parts = list(range(0, rows, rpp))
         for i, r in enumerate(parts):
             last = i == len(parts) - 1
             head = b"g%02X%d" % (row0 + r, 1 if last else 0)
-            self.send(head + full[r:r + self.rpp].tobytes())
+            self.send(head + full[r:r + rpp].tobytes())
         return len(parts)
 
     def dario(self):
@@ -243,9 +251,10 @@ class Screen:
             time.sleep(0.008)                        # each S repaints: pace them or a burst of 46 drops rows
 
     def caption(self, text):
-        text = text.encode("ascii", "replace").decode()[:72]
-        line = text.center(72)                      # cols 4..75: clear of the kernel's keyboard
-        self.send(("S%02X04" % SUB_ROW).encode() + line.encode("latin1"))   # HUD (col 0-1), never fills the row
+        w = SCR_COLS - 8
+        text = text.encode("ascii", "replace").decode()[:w]
+        line = text.center(w)                       # cols 4..: clear of the kernel's keyboard
+        self.send(("S%02X04" % (SCR_ROWS - 1)).encode() + line.encode("latin1"))   # HUD (col 0-1), never fills the row
 
     # -- latency probe: toggle a marker cell, read the framebuffer back with Y until it shows
     def geometry(self, tries=6):
@@ -261,7 +270,7 @@ class Screen:
 
     def read_pixel(self, geo, row, col):
         w, h, pitch, bpp = geo
-        x0, y0 = (w - 640) // 2, (h - 400) // 2
+        x0, y0 = max(0, (w - SCR_COLS * 8) // 2), max(0, (h - SCR_ROWS * 8) // 2)
         off = (y0 + row * 8 + 3) * pitch + (x0 + col * 8 + 1) * 4   # a pixel '@' lights (ROM font row 3, col 1)
         try:
             self.sock.sendto(b"Y%08X%04X" % (off, 16), (self.ip, self.port))
@@ -348,8 +357,9 @@ def main():
     ap.add_argument("ip", nargs="?", default="127.0.0.1", help="kernel IP (QEMU hostfwd default)")
     ap.add_argument("--port", type=int, default=int(os.environ.get("AGENTZERO_PORT", "50000")))
     ap.add_argument("--fps", type=float, default=12)
-    ap.add_argument("--cols", type=int, default=64, help="portrait width in cells (<=80)")
-    ap.add_argument("--rows", type=int, default=48, help="portrait height in cells (<=48)")
+    ap.add_argument("--screen", default="128x96", help="kernel console grid: 128x96 (pxe_cam.img) or 80x50 (older images)")
+    ap.add_argument("--cols", type=int, default=0, help="portrait width in cells (default: 4:3 filling the height)")
+    ap.add_argument("--rows", type=int, default=0, help="portrait height in cells (default: screen rows - 6)")
     ap.add_argument("--cam", type=int, default=0, help="camera index (see --list)")
     ap.add_argument("--list", action="store_true", help="enumerate cameras and exit")
     ap.add_argument("--source", default=None, help="video/image file instead of the camera")
@@ -357,7 +367,8 @@ def main():
     ap.add_argument("--no-track", action="store_true", help="no face tracking (whole frame)")
     ap.add_argument("--levels", type=int, default=3, choices=[1, 2, 3], help="brightness tiers")
     ap.add_argument("--legacy", action="store_true", help="plain B packets (old kernel: pxe_default.img)")
-    ap.add_argument("--rows-per-packet", type=int, default=8, help="8 -> ~650 B packets (real HW safe)")
+    ap.add_argument("--rows-per-packet", type=int, default=16, help="max rows per packet (bytes cap below applies too)")
+    ap.add_argument("--max-packet", type=int, default=1400, help="max UDP payload bytes; use 700 on the real Asus")
     ap.add_argument("--repeat", type=int, default=1, help="send every packet N times (lossy link)")
     ap.add_argument("--gap", type=float, default=0.0004, help="seconds between packets")
     ap.add_argument("--subtitle", action="store_true", help="mic -> whisper caption on the bottom row")
@@ -380,16 +391,21 @@ def main():
         list_cameras()
         return
     import cv2
-    if a.layout == "dual":                               # left 36x36 portrait, Dario at col 42
-        a.cols, a.rows = 36, 36
-        col0 = 2
-    elif a.layout == "brain":                            # left 38x38 portrait, brain panel at col 40
-        a.cols, a.rows = 38, 38
+    global SCR_COLS, SCR_ROWS
+    SCR_COLS, SCR_ROWS = (int(x) for x in a.screen.lower().split("x"))
+    big = SCR_COLS >= 128
+    if a.layout == "dual":                               # left square portrait, Dario at col 42
+        a.cols = a.rows = 36 if not big else 60
+        col0 = 2 if not big else 64 - 60 - 2
+    elif a.layout == "brain":                            # left square portrait, brain panel right
+        a.cols = a.rows = 38 if not big else 64
         col0 = 0
     else:
-        a.cols = min(a.cols, 80)
-        a.rows = min(a.rows, 48)
-        col0 = (80 - a.cols) // 2
+        a.rows = a.rows or SCR_ROWS - 6
+        a.cols = a.cols or a.rows * 4 // 3
+        a.cols = min(a.cols, SCR_COLS)
+        a.rows = min(a.rows, SCR_ROWS - 2)
+        col0 = (SCR_COLS - a.cols) // 2
     rend = Renderer(a.cols, a.rows, levels=a.levels, clahe=not a.no_clahe)
     tracker = None
     if not a.no_track:
@@ -445,14 +461,20 @@ def main():
             print(ln)
         return
 
-    scr = Screen(a.ip, a.port, repeat=a.repeat, gap=a.gap, rows_per_packet=a.rows_per_packet, legacy=a.legacy)
+    scr = Screen(a.ip, a.port, repeat=a.repeat, gap=a.gap, rows_per_packet=a.rows_per_packet, legacy=a.legacy,
+                 max_packet=a.max_packet)
     scr.clear()
     if a.layout == "dual":
         scr.dario()
     brain = None
     if a.layout == "brain":
         import brain_panel
-        brain = brain_panel.BrainPanel(a.ip, a.port, steps_per_frame=a.brain_steps)
+        if big:
+            brain = brain_panel.BrainPanel(a.ip, a.port, steps_per_frame=a.brain_steps,
+                                           panel_w=SCR_COLS - 66, panel_h=SCR_ROWS, raster_w=64, raster_h=SCR_ROWS - a.rows - 4)
+        else:
+            brain = brain_panel.BrainPanel(a.ip, a.port, steps_per_frame=a.brain_steps,
+                                           panel_w=40, panel_h=48, raster_w=38, raster_h=6)
         if not brain.connect():
             sys.exit("the kernel has no brain (needs pxe_cam.img / default build with HAVE_BRAIN)")
     caps = None
@@ -495,15 +517,22 @@ def main():
             if brain is not None:                         # the old PC runs its brain, we paint it
                 brain.tick(sense["motion"], sense["approach"])
                 pl, pt = brain.render()
+                rl, rt = brain.render_raster()
+                leftw = SCR_COLS - brain.W
+                nrows = min(SCR_ROWS - 1, brain.H)         # never write the last row fully
                 full_l, full_t = [], []
-                for r in range(brain_panel.PANEL_H):
-                    left = lines[r] if r < len(lines) else ""
-                    lt = tiers[r] if r < len(tiers) else []
-                    if r == len(lines) + 1:
-                        left = " motion %4.2f  approach %+5.2f" % (sense["motion"], sense["approach"])
+                for r in range(nrows):
+                    if r < len(lines):
+                        left, lt = lines[r], tiers[r]
+                    elif r == len(lines):
+                        left = " motion %4.2f  approach %+5.2f   SPIKE RASTER (time ->)" % (sense["motion"], sense["approach"])
                         lt = [1] * len(left)
-                    left = left.ljust(brain_panel.PANEL_COL0)[:brain_panel.PANEL_COL0]
-                    lt = (lt + [1] * brain_panel.PANEL_COL0)[:brain_panel.PANEL_COL0]
+                    elif r - len(lines) - 1 < len(rl):
+                        left, lt = rl[r - len(lines) - 1], rt[r - len(lines) - 1]
+                    else:
+                        left, lt = "", []
+                    left = left.ljust(leftw)[:leftw]
+                    lt = (lt + [1] * leftw)[:leftw]
                     full_l.append(left + pl[r]); full_t.append(lt + pt[r])
                 lines, tiers = full_l, full_t
             if tiers is None:

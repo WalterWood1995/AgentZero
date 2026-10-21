@@ -35,8 +35,9 @@ VGA      equ 0x00020000            ; PM text console: a RAM shadow (80x50 char+a
                                    ; present_text renders it to the framebuffer as pixels.
                                    ; (The real-mode boot animation still uses VGASEG=0xB800.)
 VGA_ATTR equ 0x0A                  ; black background, bright green foreground
-SCR_ROWS equ 50                    ; 80x50 text mode (small 8x8 font, fine detail)
-SCR_CELLS equ 80 * SCR_ROWS
+SCR_ROWS equ 96                    ; graphics console: 128x96 cells of 8x8 = the whole 1024x768
+SCR_COLS equ 128                   ; (the real-mode boot animation still uses the 80x50 VGA text mode)
+SCR_CELLS equ SCR_COLS * SCR_ROWS
 RAIN_FRAMES equ 170                ; how many animation frames the intro runs
 FRAME_COUNTS equ 29800             ; PIT ch0 counts per frame (~25 ms, CPU-independent)
 %ifdef NIC_NATIVE
@@ -602,12 +603,18 @@ pm_entry:
     mov eax, [lfb_pitch]
     mul dword [lfb_h]
     mov [fb_size], eax             ; framebuffer byte size (for image blits)
-    mov eax, [lfb_w]               ; centre the 640 x (SCR_ROWS*8) text block
-    sub eax, 640
+    mov eax, [lfb_w]               ; centre the (SCR_COLS*8) x (SCR_ROWS*8) text block
+    sub eax, SCR_COLS * 8
+    jns .x0ok
+    xor eax, eax                   ; narrower screen than the grid: pin to the left edge
+.x0ok:
     sar eax, 1
     mov [X0], eax
     mov eax, [lfb_h]
     sub eax, SCR_ROWS * 8
+    jns .y0ok
+    xor eax, eax
+.y0ok:
     sar eax, 1
     mov [Y0], eax
 .no_fb:
@@ -681,7 +688,7 @@ NET_PORT equ 0x50C3                ; UDP port 50000, network byte order (our lis
 RX_MAX   equ 1472                  ; max UDP payload we read (MTU 1500 - IP 20 - UDP 8)
 Q_PORT   equ 0x51C3                ; UDP port 50001, net order (dev-PC question port)
 DEVPC_IP equ 0x71B2A8C0            ; 192.168.178.113, network-byte-order bytes
-INPUT_ROW equ 48                   ; on-screen input line (left column)
+INPUT_ROW equ SCR_ROWS - 2                   ; on-screen input line (left column)
 net_loop:
     mov byte [net_mode], 1
     call pit_init                  ; PXE may have reprogrammed the PIT
@@ -896,9 +903,9 @@ net_loop:
     mov bl, 2
     call phex                      ; col
     and eax, 0x7F
-    imul ecx, ecx, 80
+    imul ecx, ecx, SCR_COLS
     add ecx, eax
-    mov [vga_pos], ecx             ; cursor = row*80 + col
+    mov [vga_pos], ecx             ; cursor = row*SCR_COLS + col
     mov esi, [parse_ptr]           ; text after the hex fields
     call vga_puts
     mov byte [need_present], 1
@@ -931,8 +938,8 @@ net_loop:
     test al, al
     jz  .blk_done                  ; end of packet
     mov eax, [blk_row]
-    imul eax, eax, 80
-    mov [vga_pos], eax             ; cursor = row*80 (col 0)
+    imul eax, eax, SCR_COLS
+    mov [vga_pos], eax             ; cursor = row*SCR_COLS (col 0)
 .blk_wr:
     mov al, [esi]
     test al, al
@@ -961,15 +968,15 @@ net_loop:
     mov byte [need_present], 1     ; repaint the console with the new block of text
     jmp .poll
 .do_gray:
-    ; g<2hex row><1hex repaint><raw grey bytes, 80 per row>: the old PC renders the
+    ; g<2hex row><1hex repaint><raw grey bytes, SCR_COLS per row>: the old PC renders the
     ; picture itself - each byte -> one of 10 ramp chars (" .:-=+*#%@") and dim /
-    ; bright / white by brightness. One row = 80 bytes, so a packet carries whole rows.
+    ; bright / white by brightness. One row = SCR_COLS bytes, so a packet carries whole rows.
     mov byte [rain_on], 0
     mov dword [parse_ptr], rx_buf + 1
     mov bl, 2
     call phex                      ; start row (phex keeps ecx = packet length)
     and eax, 0x7F
-    imul edi, eax, 80
+    imul edi, eax, SCR_COLS
     shl edi, 1
     add edi, VGA                   ; cell pointer at (row, col 0)
     mov bl, 1
@@ -1832,9 +1839,9 @@ show_face:
     cmp ecx, FACE_H
     jae .d
     mov eax, ecx
-    imul eax, eax, 80
+    imul eax, eax, SCR_COLS
     add eax, FACE_COL
-    mov [vga_pos], eax             ; cursor = row*80 + FACE_COL
+    mov [vga_pos], eax             ; cursor = row*SCR_COLS + FACE_COL
     mov esi, face_data
     mov eax, ecx
     imul eax, eax, FACE_W
@@ -1856,7 +1863,7 @@ show_face:
 ; draw_prompt: draw "> " at the start of the input line.
 draw_prompt:
     mov dword [kbd_len], 0
-    mov edi, INPUT_ROW * 80 * 2 + VGA
+    mov edi, INPUT_ROW * SCR_COLS * 2 + VGA
     mov word [edi], 0x0A3E         ; '>'
     mov word [edi+2], 0x0A20       ; ' '
     ; enable & shape the hardware text cursor (underline, visible)
@@ -1872,7 +1879,7 @@ draw_prompt:
     mov dx, 0x3D5
     mov al, 0x0F                   ; end scanline 15
     out dx, al
-    mov eax, INPUT_ROW * 80 + 2
+    mov eax, INPUT_ROW * SCR_COLS + 2
     call set_cursor
     ret
 
@@ -1949,7 +1956,7 @@ kbd_init:
     ret
 
 ; hud_byte: AL = byte -> two hex chars at VGA cell [EDI] (attr 0x0E). Preserves regs.
-HUD_CELL equ 49 * 80 * 2           ; bottom-left corner, clear of face & dialogue
+HUD_CELL equ (SCR_ROWS - 1) * SCR_COLS * 2           ; bottom-left corner, clear of face & dialogue
 hud_byte:
     push eax
     push ebx
@@ -2181,7 +2188,7 @@ kbd_char:
     jae .done
     mov [kbd_buf + ebx], al
     inc dword [kbd_len]
-    mov edi, INPUT_ROW * 80 + 2
+    mov edi, INPUT_ROW * SCR_COLS + 2
     add edi, ebx
     shl edi, 1
     add edi, VGA
@@ -2193,7 +2200,7 @@ kbd_char:
     je  .done
     dec dword [kbd_len]
     movzx ebx, byte [kbd_len]
-    mov edi, INPUT_ROW * 80 + 2
+    mov edi, INPUT_ROW * SCR_COLS + 2
     add edi, ebx
     shl edi, 1
     add edi, VGA
@@ -2204,7 +2211,7 @@ kbd_char:
     je  .done
     call send_question             ; UDP the line to the dev-PC agent service
     ; clear the input line
-    mov edi, (INPUT_ROW * 80 + 2) * 2 + VGA
+    mov edi, (INPUT_ROW * SCR_COLS + 2) * 2 + VGA
     mov ecx, 72
     mov ax, 0x0A20
 .cl:
@@ -2215,7 +2222,7 @@ kbd_char:
     mov dword [kbd_len], 0
 .done:
     mov eax, [kbd_len]             ; keep the hardware cursor at the caret
-    add eax, INPUT_ROW * 80 + 2
+    add eax, INPUT_ROW * SCR_COLS + 2
     call set_cursor
     popad
     ret
@@ -2284,15 +2291,15 @@ vga_putc:
 .cr:
     mov eax, [vga_pos]
     xor edx, edx
-    mov ecx, 80
+    mov ecx, SCR_COLS
     div ecx                        ; eax=row
-    mul ecx                        ; eax=row*80
+    mul ecx                        ; eax=row*SCR_COLS
     mov [vga_pos], eax
     jmp .done
 .lf:
     mov eax, [vga_pos]
     xor edx, edx
-    mov ecx, 80
+    mov ecx, SCR_COLS
     div ecx
     inc eax                        ; next row
     mul ecx
@@ -2309,9 +2316,9 @@ vga_putc:
 ; vga_scroll: scroll up one line, clear the last line, cursor to last line start.
 vga_scroll:
     pushad
-    mov esi, VGA + 160
+    mov esi, VGA + SCR_COLS * 2
     mov edi, VGA
-    mov ecx, (SCR_ROWS-1) * 80
+    mov ecx, (SCR_ROWS-1) * SCR_COLS
 .c:
     mov ax, [esi]
     mov [edi], ax
@@ -2319,15 +2326,15 @@ vga_scroll:
     add edi, 2
     dec ecx
     jnz .c
-    mov edi, VGA + (SCR_ROWS-1) * 80 * 2
-    mov ecx, 80
+    mov edi, VGA + (SCR_ROWS-1) * SCR_COLS * 2
+    mov ecx, SCR_COLS
     mov ax, (VGA_ATTR << 8) | ' '
 .cl:
     mov [edi], ax
     add edi, 2
     dec ecx
     jnz .cl
-    mov dword [vga_pos], (SCR_ROWS-1) * 80
+    mov dword [vga_pos], (SCR_ROWS-1) * SCR_COLS
     popad
     ret
 
@@ -2544,7 +2551,7 @@ rain_intro:
     mov bh, 0x0F                   ; white head
 .wr:
     pop eax
-    imul eax, eax, 80
+    imul eax, eax, SCR_COLS
     add eax, ecx
     shl eax, 1
     add eax, VGA
@@ -2579,7 +2586,7 @@ rain_intro:
     cmp eax, SCR_ROWS
     jge .cc_done
     push ebx
-    imul eax, eax, 80
+    imul eax, eax, SCR_COLS
     add eax, ecx
     shl eax, 1
     add eax, VGA
@@ -2635,7 +2642,7 @@ rain_bg_step:
     jl  .noerase
     cmp eax, SCR_ROWS
     jge .noerase
-    imul eax, eax, 80
+    imul eax, eax, SCR_COLS
     add eax, ecx
     shl eax, 1
     add eax, VGA
@@ -2670,7 +2677,7 @@ rain_bg_step:
     cmp eax, SCR_ROWS
     jge .next
     mov edx, eax                   ; row
-    imul eax, eax, 80
+    imul eax, eax, SCR_COLS
     add eax, ecx
     shl eax, 1
     add eax, VGA
@@ -2886,7 +2893,7 @@ clear_lfb:
 .q:
     ret
 
-; present_text: paint the 80 x SCR_ROWS text buffer at VGA (0xB8000) into the LFB.
+; present_text: paint the SCR_COLS x SCR_ROWS text buffer at VGA (0xB8000) into the LFB.
 present_text:
     cmp byte [vbe_ok], 0
     je  .q
@@ -2896,14 +2903,14 @@ present_text:
     xor ecx, ecx                   ; col
 .pcol:
     mov eax, ebx
-    imul eax, 80
+    imul eax, SCR_COLS
     add eax, ecx
     shl eax, 1
     movzx edx, byte [VGA + eax]    ; char
     movzx esi, byte [VGA + eax + 1]; attr
     call draw_glyph
     inc ecx
-    cmp ecx, 80
+    cmp ecx, SCR_COLS
     jb  .pcol
     inc ebx
     cmp ebx, SCR_ROWS
