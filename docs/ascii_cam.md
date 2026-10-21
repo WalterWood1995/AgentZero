@@ -82,3 +82,16 @@ CHAT_ROW0=38 CHAT_PANE_H=10 PYTHONUTF8=1 python agent_chat.py
 6. 换回线虫/街机版：`Copy-Item pxe_before_cam_backup_<日期>.img pxe.img`（或 pxe_worm.img / pxe_arcade.img），再手动开机。
 
 硬约束照旧：不碰 SATA、不碰 agentctl、不覆盖 pxe_worm.img。
+
+## 5. `--layout brain`：你的脸 + 老 PC 自己算的线虫大脑（2026-10-21 加）
+
+右半屏是 C. elegans 302 神经元 LIF 大脑，**每一步都在老 PC 的 CPU 上算**（聊天脸内核内置 brain.asm 的 `n` 指令）。
+每帧：摄像头里的动作 → 感觉输入（动得大=头部触觉 ALM/AVM，猛动=尾部 PLM；凑近=ASEL 食物变近，后仰=ASER/AWC）
+→ `L` 载入 EXT 向量 → `nS000A` 跑 10 步 → 读回 302 个电位 + 放电位图 → 画成三列组（感觉 2 列 / 中间 3 列 / 运动 3 列）：
+`.` `:` 暗绿=静息/上升，`+` `*` `#` 亮绿=接近阈值，`@` 白=本步放电，白 `+`=放电神经元的突触后目标被击中，组间 `-`=信号向右传。
+右侧小栏：IN（摄像头触发的刺激）、OUT（前进/后退运动池放电条）、active、lost（丢的 nS 回包）。
+
+```bash
+PYTHONUTF8=1 python ascii_cam.py 192.168.178.114 --layout brain --fps 10 --mirror --repeat 2
+```
+QEMU 实测 12 fps、每帧 6 包 + 1 个 L + 1 个 nS 往返、lost 0。`brain_panel.py` 可单独 import。
