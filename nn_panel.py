@@ -32,7 +32,7 @@ class NNPanel:
         self.n = 0
         self.trace = None
         self.lost = 0
-        self.rng = np.random.default_rng(3)
+        self.hist = []                                   # hidden activations of recent probes
 
     # ---- the old PC side ------------------------------------------------------------
     def set_probe(self):
@@ -106,14 +106,33 @@ class NNPanel:
         self._matrix(put, 48, self.W1q.T, 8.0)            # 9 rows x 32 cols
         put(58, 0, "W2  16 glyphs x 32 hidden", 2)
         self._matrix(put, 59, self.W2q, 4.0)              # 16 rows x 32 cols
-        put(76, 0, "ARITHMETIC ON THE OLD PC:", 2)
-        put(77, 0, "x[9] * W1 -> 32 sums", 1)
-        put(78, 0, "shift, clamp 0..4095", 1)
-        put(79, 0, "h[32] * W2 -> 16 scores", 1)
-        put(80, 0, "argmax -> ROM glyph", 1)
-        put(81, 0, "colour: grey<%d dim <%d bright" % (self.t1, self.t2), 1)
-        put(83, 0, "frame %d  %.1f fps  trace lost %d" % (self.n, fps, self.lost), 1)
-        put(84, 0, "Asus K50IJ T4300, no OS", 1)
+        # live multiply-accumulate of ONE hidden unit (a different one every frame): the
+        # exact integers the old PC just multiplied, the running sum, the shift and clamp,
+        # checked against the h[j] it reported
+        j = self.n % 32
+        w = self.W1q[j]
+        prods = [int(x[i]) * int(w[i]) for i in range(9)]
+        acc = sum(prods) + int(self.b1q[j])
+        hj = max(0, min(4095, acc >> 6))
+        put(76, 0, "MAC TRACE  hidden unit %2d" % j, 3)
+        run = 0
+        for i in range(9):
+            run += prods[i]
+            put(77 + i, 0, "x%d %3d*w%+4d=%+7d sum %+8d" % (i, int(x[i]), int(w[i]), prods[i], run), 2 if i == 4 else 1)
+        put(86, 0, "+b %+7d -> %+8d >>6 clamp" % (int(self.b1q[j]), acc), 2)
+        put(87, 0, "= h[%2d] %4d  %s" % (j, hj, "old PC says %4d OK" % int(h[j]) if hj == int(h[j]) else "MISMATCH %d" % int(h[j])),
+            3 if hj == int(h[j]) else 2)
+        put(87, 20 + 0, "", 1)
+        # hidden-layer activity over the last frames: 32 columns = hidden units, newest row last
+        self.hist.append(np.array(h[:32]))
+        del self.hist[:-6]
+        put(88, 0, "h[0..31] last %d frames:" % len(self.hist), 2)
+        glyph = " .:+*#"
+        for r, hv in enumerate(self.hist):
+            line = "".join(glyph[min(5, int(v) * 6 // 4096)] for v in hv)
+            for c, g in enumerate(line):
+                put(89 + r, c, g, 3 if g == "#" else (2 if g in "+*" else 1))
+        put(89 + len(self.hist), 0, "frame %d %.1f fps lost %d  no OS" % (self.n, fps, self.lost), 1)
         return ["".join(r) for r in ch], tr
 
     @staticmethod
