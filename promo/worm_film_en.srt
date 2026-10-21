@@ -1,0 +1,63 @@
+1
+00:00:05,200 --> 00:00:10,000
+This is a 2009 Asus K50IJ. Its disk controller makes every Linux hang at boot.
+
+2
+00:00:10,000 --> 00:00:15,000
+Now it has no OS: it pulls a 41 KB bare-metal kernel over the network at boot, then the cable can be unplugged. It keeps living.
+
+3
+00:00:15,000 --> 00:00:20,500
+Left: a worm in a petri dish. Right: its brain - 302 neurons, 10,193 synapses, all from the public OpenWorm connectome.
+
+4
+00:00:20,500 --> 00:00:26,000
+Press H to poke its head: touch neurons ALM/AVM fire, activity travels along the wires to the command neurons, the motor area turns magenta - it reverses.
+
+5
+00:00:26,000 --> 00:00:31,500
+Every line that lights up is a real synapse used in that step. Not an animation: a state the CPU computes 120 times a second.
+
+6
+00:00:31,500 --> 00:00:37,500
+Each body segment bends by the activation of its own dorsal and ventral muscles; the orange glow is food, and it crawls up the gradient.
+
+7
+00:00:37,500 --> 00:00:46,000
+All of it runs on this 2009 dual-core CPU: int16 fixed point, SSE2 multiply-add, two brain steps per frame, not one line of OS code.
+
+8
+00:00:46,200 --> 00:00:50,000
+What follows is the same kernel in an unattended QEMU run - the picture is identical to the real machine.
+
+9
+00:00:50,000 --> 00:00:54,500
+Free crawling: the forward command neurons AVB stay active, B-class motor neurons drive the muscles, the body makes a travelling wave.
+
+10
+00:00:54,800 --> 00:01:00,000
+Poke the head: the ALM/AVM to AVD/AVA escape circuit takes over, A-class motor neurons fire, the worm backs up and turns.
+
+11
+00:01:00,000 --> 00:01:04,000
+FWD / BWD in the status line are the live spike counts of the forward and backward motor neurons.
+
+12
+00:01:04,000 --> 00:01:09,000
+Poke the tail: PLM to PVC to AVB - it surges forward and does not reverse.
+
+13
+00:01:09,000 --> 00:01:14,000
+Drop food: ASEL / ASER sense the concentration rising and falling, and it follows the gradient into the glow.
+
+14
+00:01:14,000 --> 00:01:20,500
+On the food: the pharyngeal neurons NSM / MC are driven, it slows down; the blue dot in the head is the pharynx pumping - 150 pumps and the food is gone.
+
+15
+00:01:20,500 --> 00:01:25,500
+Poke the head again and it reverses again - every response comes from the same connectome.
+
+16
+00:01:25,500 --> 00:01:29,500
+This is a qualitative cartoon: the wiring is real, the neuron dynamics are a simplified integrate-and-fire model.
