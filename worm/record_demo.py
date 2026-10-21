@@ -75,8 +75,9 @@ def main():
     try:
         run_beats(vm, state, grab, caps, t_kernel, mono)
     finally:
+        time.sleep(0.5)
         vm.close()
-    assemble(caps)
+    assemble([c for c in caps if os.path.isfile(c[1])])
 
 
 def run_beats(vm, state, grab, caps, t_kernel, mono):
