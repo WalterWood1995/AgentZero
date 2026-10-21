@@ -107,3 +107,11 @@ QEMU 实测 12 fps、每帧 6 包 + 1 个 L + 1 个 nS 往返、lost 0。`brain_
   注意不能用 `M` 读文字缓冲来对账——M 的回显也会打到屏幕上把画面冲掉。
 - 用法：`python ascii_cam.py 192.168.178.114 --nn --fps 10 --max-packet 700`（先自动把权重装进老机）。QEMU（TCG）8 fps，真机原生执行预计更快。
 - 老机字体：`nnascii/font_asus.bin` 是从真机用 M 指令读回的 ROM 8x8 字体（`@` 等字形和 QEMU 不同）。
+
+## 7. 定版（2026-10-21 21:10，吴总确认）：`--layout nn`
+
+```bash
+PYTHONUTF8=1 python ascii_cam.py 192.168.178.114 --layout nn --fps 10 --mirror --max-packet 700 --duration 3600
+```
+左 90x90 = 老机神经网络实时生成的本人脸（内置摄像头走 Media Foundation），右 36 列 = 模型运算面板：探针格输入/隐藏层/输出分数/W1/W2 权重图/逐帧轮播的乘加过程（和老机报回的 h[j] 对账）/隐藏层激活热图。
+内核 pxe.img = pxe_cam.img（41 扇区，指令 b/g/i/y/p + NN_LIMIT），远程重启用 `K!`。真机 10 fps、28 包/帧、trace 零丢失。截屏：`python fb_screenshot.py`。
