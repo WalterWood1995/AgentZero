@@ -366,8 +366,10 @@ def main():
     ap.add_argument("--no-clahe", action="store_true", help="plain global autocontrast only")
     ap.add_argument("--kernel-render", action="store_true",
                     help="send raw grey bytes; the old PC's CPU maps brightness to chars (g command)")
-    ap.add_argument("--layout", default="single", choices=["single", "dual"],
-                    help="dual: you (36x36, left) + Dario face (right); agent_chat text fits below")
+    ap.add_argument("--layout", default="single", choices=["single", "dual", "brain"],
+                    help="dual: you (36x36, left) + Dario face (right); agent_chat text fits below; "
+                         "brain: you (left) + the C. elegans brain computed by the old PC (right)")
+    ap.add_argument("--brain-steps", type=int, default=10, help="brain steps per video frame")
     ap.add_argument("--no-translate", action="store_true", help="caption in the spoken language (ASCII only shows)")
     ap.add_argument("--once", action="store_true", help="render one frame to stdout and exit")
     ap.add_argument("--duration", type=float, default=0, help="stop after N seconds (0 = forever)")
@@ -381,6 +383,9 @@ def main():
     if a.layout == "dual":                               # left 36x36 portrait, Dario at col 42
         a.cols, a.rows = 36, 36
         col0 = 2
+    elif a.layout == "brain":                            # left 38x38 portrait, brain panel at col 40
+        a.cols, a.rows = 38, 38
+        col0 = 0
     else:
         a.cols = min(a.cols, 80)
         a.rows = min(a.rows, 48)
@@ -400,6 +405,8 @@ def main():
         cap = open_camera(a.cam) if not a.source else cv2.VideoCapture(a.source)
         grab = cap.read
 
+    sense = {"motion": 0.0, "approach": 0.0, "prev": None, "prev_h": None}
+
     def one_frame():
         ok, bgr = grab()
         if not ok:
@@ -408,6 +415,10 @@ def main():
             bgr = cv2.flip(bgr, 1)
         if tracker:
             bgr = tracker.crop(bgr)
+            bh = bgr.shape[0]
+            if sense["prev_h"]:                          # leaning in / out = box height change
+                sense["approach"] = 0.7 * sense["approach"] + 0.3 * (bh - sense["prev_h"]) / sense["prev_h"]
+            sense["prev_h"] = bh
         else:                                            # centre crop to the cell aspect
             h, w = bgr.shape[:2]
             want = a.cols / a.rows
@@ -416,6 +427,10 @@ def main():
             else:
                 nh = int(w / want); bgr = bgr[(h - nh) // 2:(h - nh) // 2 + nh]
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        g32 = cv2.resize(gray, (32, 32)).astype(np.float32)
+        if sense["prev"] is not None:                    # motion energy inside the face box
+            sense["motion"] = float(np.abs(g32 - sense["prev"]).mean() / 64.0)
+        sense["prev"] = g32
         if a.kernel_render:
             return rend.gray_cells(gray), None
         return rend.render(gray)
@@ -434,6 +449,12 @@ def main():
     scr.clear()
     if a.layout == "dual":
         scr.dario()
+    brain = None
+    if a.layout == "brain":
+        import brain_panel
+        brain = brain_panel.BrainPanel(a.ip, a.port, steps_per_frame=a.brain_steps)
+        if not brain.connect():
+            sys.exit("the kernel has no brain (needs pxe_cam.img / default build with HAVE_BRAIN)")
     caps = None
     if a.subtitle:
         caps = Captions(model=a.whisper_model, translate=not a.no_translate, device=a.mic)
@@ -471,6 +492,20 @@ def main():
                     lines[0] = ("@" if marker else " ") + lines[0][1:]
                     tiers[0][0] = 3
             tb = time.time()
+            if brain is not None:                         # the old PC runs its brain, we paint it
+                brain.tick(sense["motion"], sense["approach"])
+                pl, pt = brain.render()
+                full_l, full_t = [], []
+                for r in range(brain_panel.PANEL_H):
+                    left = lines[r] if r < len(lines) else ""
+                    lt = tiers[r] if r < len(tiers) else []
+                    if r == len(lines) + 1:
+                        left = " motion %4.2f  approach %+5.2f" % (sense["motion"], sense["approach"])
+                        lt = [1] * len(left)
+                    left = left.ljust(brain_panel.PANEL_COL0)[:brain_panel.PANEL_COL0]
+                    lt = (lt + [1] * brain_panel.PANEL_COL0)[:brain_panel.PANEL_COL0]
+                    full_l.append(left + pl[r]); full_t.append(lt + pt[r])
+                lines, tiers = full_l, full_t
             if tiers is None:
                 pk_frame = scr.gray_frame(lines, col0)
             else:
@@ -502,6 +537,8 @@ def main():
                     msg += "  kernel latency %.0f ms (n=%d)" % (1000 * sum(lat[-5:]) / len(lat[-5:]), len(lat))
                 if caps:
                     msg += "  cap: %s" % caps.text[:40]
+                if brain is not None:
+                    msg += "  brain step %d fired %d lost %d" % (brain.step_count, int(brain.spk.sum()), brain.lost)
                 print(msg, flush=True)
                 last_stat = time.time()
     except KeyboardInterrupt:
