@@ -80,7 +80,9 @@ BWD_CMD = ["AVAL", "AVAR", "AVDL", "AVDR", "AVEL", "AVER"]
 BIAS = {"AVBL": 110, "AVBR": 110, "PVCL": 44, "PVCR": 44}
 # neurons the environment stimulates (fixed slots in the header)
 STIM_SLOTS = ["ALML", "ALMR", "AVM", "PLML", "PLMR", "ASEL", "ASER",
-              "AWCL", "AWCR", "AWAL", "AWAR", "ASHL", "ASHR", "PVDL", "PVDR", "FLPL"]
+              "AWCL", "AWCR", "AWAL", "AWAR", "ASHL", "NSML", "NSMR", "MCL", "MCR"]
+# slots 12..15: pharyngeal neurons driven while the worm sits on food (NSM = serotonergic
+# "food here, slow down" cells; MC = pharyngeal pumping pacemakers)
 
 PHARYNX = {"I1L", "I1R", "I2L", "I2R", "I3", "I4", "I5", "I6", "M1", "M2L", "M2R",
            "M3L", "M3R", "M4", "M5", "MCL", "MCR", "MI", "NSML", "NSMR"}

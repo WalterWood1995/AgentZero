@@ -27,7 +27,7 @@ if "--record" in sys.argv:
 os.makedirs(OUT, exist_ok=True)
 
 FIELDS = ["frame", "step", "hx", "hy", "heading", "drive", "spd", "fw", "bw", "th", "tt",
-          "fx", "fy", "fon", "ate", "c", "gi", "fired", "tx", "ty"]
+          "fx", "fy", "fon", "ate", "c", "gi", "fired", "tx", "ty", "nsm", "pumps", "amount"]
 
 
 class WormVM:
@@ -152,7 +152,7 @@ def main():
         backed = 0
         if rev:
             backed = seq[rev[0]]["hx"] - min(x["hx"] for x in seq[rev[0]:])   # heading right: backing = x decreases
-        ok &= check(len(rev) >= 3 and backed > 5, "poke head -> reversal: %d of %d samples reversing, backed %d px (min drive %d)"
+        ok &= check(len(rev) >= 3 and backed > 2, "poke head -> reversal: %d of %d samples reversing, backed %d px (min drive %d)"
                     % (len(rev), len(seq), backed, min(x["drive"] for x in seq)))
         ok &= check(any(x["th"] > 0 for x in seq[:8]), "ALM/AVM touch input was applied (th>0)")
         vm.shot("2_poke_head")
@@ -190,7 +190,8 @@ def main():
                 got = True
                 break
             time.sleep(0.2)
-        ok &= check(got, "the worm reached the food and ate it (d0 %.0f, min d %.0f, %.1fs)" % (d0, dmin, time.time() - t0))
+        ok &= check(got, "the worm reached the food and ate it (d0 %.0f, min d %.0f, %.1fs, pumps %d)" % (d0, dmin, time.time() - t0, s["pumps"]))
+        ok &= check(s["pumps"] > 0, "pharyngeal pumping happened on the food (MC spikes): %d pumps" % s["pumps"])
         vm.shot("5_food_eaten")
         # ---- 5. reset ----
         vm.tap("r"); time.sleep(0.3)

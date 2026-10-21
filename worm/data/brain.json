@@ -52,10 +52,10 @@
   "AWAL",
   "AWAR",
   "ASHL",
-  "ASHR",
-  "PVDL",
-  "PVDR",
-  "FLPL"
+  "NSML",
+  "NSMR",
+  "MCL",
+  "MCR"
  ],
  "bias": {
   "AVBL": 110,

@@ -26,7 +26,7 @@ DISH_R      equ 340
 FOOD_R      equ 180
 FOOD_R2     equ FOOD_R * FOOD_R
 EAT_R       equ 24
-TOUCH_FRAMES equ 90                ; brain steps (2 per frame): a poke-and-hold of 0.75 s
+TOUCH_FRAMES equ 120               ; brain steps (2 per frame): a poke-and-hold of 1 s
 TOUCH_EXT   equ 300
 CHEMO_GAIN  equ 12
 SWING_AMP   equ 46
@@ -35,6 +35,22 @@ SPEED_MAX   equ 4                  ; speed unit = 1/4 px per frame -> max 1 px/f
 SPEED_SHIFT equ 5                  ; spd = drive >> 5, clamped to +-SPEED_MAX
 DRIVE_SHIFT equ 4
 OMEGA_TURN  equ 40
+AMP_MAX     equ 12                 ; px: max lateral wave amplitude a segment's muscles produce
+AMP_SHIFT   equ 5                  ; amplitude = (dorsal + ventral activation) >> 5
+BIAS_SHIFT  equ 6                  ; lateral bias = (dorsal - ventral) >> 6, clamped
+BIAS_MAX    equ 4
+WAVE_K      equ 11                 ; phase lag per segment (angle units)
+HEAD_SEGS   equ 4                  ; head segments add a foraging sweep of their own
+HEAD_RATE   equ 3                  ; head sweep phase advance per frame
+HEAD_AMP_SHIFT equ 6
+HEAD_AMP_MAX equ 8
+TURN_SHIFT  equ 10                 ; steer (Q4) = clamp(high-passed head dorsal-ventral >> 10, +-TURN_MAX)
+TURN_MAX    equ 4
+FOOD_ON_C   equ 160                ; concentration above which the pharynx is driven (food core)
+PHARYNX_GAIN equ 1
+NSM_SLOW_FRAMES equ 30             ; an NSM spike halves the speed for this many frames
+FOOD_AMOUNT equ 150                ; pharyngeal pumps on the core needed to finish the food
+C_PUMP      equ 0x002030C0         ; pharynx dot while pumping
 OMEGA_MIN_BACK equ 16              ; frames: a shorter reversal ends without an omega turn
 FOOD_RESPAWN equ 120
 BG_LAYER    equ 0x00400000         ; background copy of the screen (3 MiB)
@@ -201,6 +217,18 @@ worm_reset:
     mov dword [w_bw], 0
     mov dword [w_finger_x], -1
     mov dword [w_keys_prev], 0
+    mov dword [w_phase_head], 0
+    mov dword [w_dv_slow], 0
+    mov dword [w_steer], 0
+    mov dword [w_steer_acc], 0
+    mov dword [w_nsm_timer], 0
+    mov dword [w_pump], 0
+    mov dword [w_pumps], 0
+    mov dword [w_food_amount], FOOD_AMOUNT
+    mov edi, w_lat
+    mov ecx, NSEG
+    xor eax, eax
+    rep stosd
     call bg_draw_all
     call bg_blit_all
     call hud_static
@@ -345,6 +373,25 @@ worm_sense:
     sub ebx, ecx
     add ebx, eax
     mov [w_c_slow], ebx            ; c_slow = c_slow - c_slow>>3 + c
+    push eax
+    mov eax, [w_c_now]
+    cmp eax, FOOD_ON_C
+    jle .nofood
+    imul eax, PHARYNX_GAIN         ; sitting on food: drive the pharynx (NSM, MC)
+    cmp eax, TOUCH_EXT
+    jle .pf
+    mov eax, TOUCH_EXT
+.pf:
+    mov ecx, 12
+    call ext_add
+    mov ecx, 13
+    call ext_add
+    mov ecx, 14
+    call ext_add
+    mov ecx, 15
+    call ext_add
+.nofood:
+    pop eax
     shl eax, 3
     sub eax, ebx                   ; dc = 8c - c_slow
     jz  .d
@@ -386,11 +433,13 @@ worm_think:
     add esi, eax
     call brain_bwd
     add edi, eax
+    call pharynx_check
     pop ecx
     dec ecx
     jnz .s
     mov [w_fw], esi
     mov [w_bw], edi
+    call muscle_offsets
     mov eax, [w_drive]
     mov ebx, eax
     sar ebx, DRIVE_SHIFT
@@ -398,6 +447,171 @@ worm_think:
     add eax, esi
     sub eax, edi
     mov [w_drive], eax
+    ret
+
+; stim_fired: ECX = stim slot -> ZF clear if that neuron fired this step
+stim_fired:
+    push ebx
+    mov ebx, [br_blob]
+    movzx ebx, word [ebx + 64 + ecx*2]
+    cmp word [BR_S + ebx*2], 0
+    pop ebx
+    ret
+
+; pharynx_check (after a brain step): NSM spike -> slow down; MC spike -> a pump,
+; and pumping on the food core eats it. Preserves ESI/EDI.
+pharynx_check:
+    push esi
+    push edi
+    mov ecx, 12
+    call stim_fired
+    jne .nsm
+    mov ecx, 13
+    call stim_fired
+    je  .mc
+.nsm:
+    mov dword [w_nsm_timer], NSM_SLOW_FRAMES
+.mc:
+    mov ecx, 14
+    call stim_fired
+    jne .pump
+    mov ecx, 15
+    call stim_fired
+    je  .d
+.pump:
+    mov dword [w_pump], 4
+    inc dword [w_pumps]
+    cmp dword [w_food_on], 0
+    je  .d
+    cmp dword [w_c_now], FOOD_ON_C
+    jle .d
+    dec dword [w_food_amount]
+    jg  .d
+    call eat_food
+.d:
+    pop edi
+    pop esi
+    ret
+
+; eat_food: the food is finished (contact or pumping)
+eat_food:
+    pushad
+    inc dword [w_ate]
+    mov dword [w_food_on], 0
+    mov dword [w_food_timer], FOOD_RESPAWN
+    mov eax, 800                   ; high chirp
+    mov ecx, 6
+    call worm_beep
+    call bg_draw_all
+    call bg_blit_all
+    call hud_static
+    popad
+    ret
+
+; muscle_offsets: per segment lateral offset (px) from its body-wall muscles:
+; amplitude from dorsal+ventral activation, bias from dorsal-ventral, the head
+; segments add a foraging sweep; head muscles steer (high-passed, Q4).
+muscle_offsets:
+    pushad
+    xor ecx, ecx                   ; k
+    xor ebp, ebp                   ; dv (head, k < 8)
+.k:
+    mov edi, [br_muscle_row0]
+    add edi, ecx
+    movsx eax, word [BR_V + edi*2]          ; MDL
+    movsx ebx, word [BR_V + edi*2 + 48]     ; MDR
+    add eax, ebx
+    sar eax, 1                              ; md
+    movsx ebx, word [BR_V + edi*2 + 96]     ; MVL
+    movsx edx, word [BR_V + edi*2 + 144]    ; MVR
+    add ebx, edx
+    sar ebx, 1                              ; mv
+    mov [w_md], eax
+    mov [w_mv], ebx
+    cmp ecx, 8
+    jae .nodv
+    sub eax, ebx
+    add ebp, eax
+    mov eax, [w_md]
+.nodv:
+    add eax, ebx                            ; md + mv
+    mov edx, eax
+    sar eax, AMP_SHIFT
+    cmp eax, 0
+    jge .a1
+    xor eax, eax
+.a1:
+    cmp eax, AMP_MAX
+    jle .a2
+    mov eax, AMP_MAX
+.a2:
+    mov [w_amp], eax
+    sar edx, HEAD_AMP_SHIFT
+    cmp edx, 0
+    jge .h1
+    xor edx, edx
+.h1:
+    cmp edx, HEAD_AMP_MAX
+    jle .h2
+    mov edx, HEAD_AMP_MAX
+.h2:
+    mov [w_hamp], edx
+    mov eax, [w_md]
+    sub eax, [w_mv]
+    sar eax, BIAS_SHIFT
+    cmp eax, -BIAS_MAX
+    jge .b1
+    mov eax, -BIAS_MAX
+.b1:
+    cmp eax, BIAS_MAX
+    jle .b2
+    mov eax, BIAS_MAX
+.b2:
+    mov [w_bias], eax
+    ; o = amp * sin(phase - k*WAVE_K) >> 14 + bias
+    mov eax, ecx
+    imul eax, WAVE_K
+    neg eax
+    add eax, [w_phase]
+    call sin_q14
+    imul eax, [w_amp]
+    sar eax, 14
+    add eax, [w_bias]
+    cmp ecx, HEAD_SEGS
+    jae .noh
+    push eax
+    mov eax, [w_phase_head]
+    call sin_q14
+    imul eax, [w_hamp]
+    sar eax, 14
+    pop edx
+    add eax, edx
+.noh:
+    mov [w_lat + ecx*4], eax
+    inc ecx
+    cmp ecx, NSEG
+    jb  .k
+    ; steering: dv_slow = dv_slow - dv_slow>>4 + dv ; steer = clamp((dv*16 - dv_slow) >> 10, +-4)
+    mov eax, [w_dv_slow]
+    mov ebx, eax
+    sar ebx, 4
+    sub eax, ebx
+    add eax, ebp
+    mov [w_dv_slow], eax
+    mov ebx, ebp
+    shl ebx, 4
+    sub ebx, eax
+    sar ebx, TURN_SHIFT
+    cmp ebx, -TURN_MAX
+    jge .s1
+    mov ebx, -TURN_MAX
+.s1:
+    cmp ebx, TURN_MAX
+    jle .s2
+    mov ebx, TURN_MAX
+.s2:
+    mov [w_steer], ebx
+    popad
     ret
 
 ; ---------------------------------------------------------------------
@@ -501,7 +715,32 @@ worm_move:
     jge .c2
     mov eax, -SPEED_MAX
 .c2:
+    cmp dword [w_nsm_timer], 0
+    je  .noslow
+    dec dword [w_nsm_timer]
+    mov ebx, eax                   ; on food: halve the speed (truncating)
+    shr ebx, 31
+    add eax, ebx
+    sar eax, 1
+.noslow:
     mov [w_spd], eax
+    cmp dword [w_pump], 0
+    je  .nopump
+    dec dword [w_pump]
+.nopump:
+    mov ebx, [w_phase_head]
+    add ebx, HEAD_RATE
+    and ebx, 255
+    mov [w_phase_head], ebx
+    mov ebx, [w_steer_acc]         ; head muscles steer (Q4 accumulator)
+    add ebx, [w_steer]
+    mov edx, ebx
+    sar edx, 4
+    add edx, [w_heading]
+    and edx, 255
+    mov [w_heading], edx
+    and ebx, 15
+    mov [w_steer_acc], ebx
     test eax, eax
     jz  .food
     jle .noomega
@@ -526,31 +765,25 @@ worm_move:
     inc dword [w_back_frames]
 .wb:
     mov [w_was_back], ebx
-    ; phase += |spd| * SWING_RATE
+    ; phase += spd * SWING_RATE (signed: a reversal runs the wave forward)
+    mov ebx, eax
+    imul ebx, SWING_RATE
+    sar ebx, 2
+    add ebx, [w_phase]
+    and ebx, 255
+    mov [w_phase], ebx
     mov ebx, eax
     cmp ebx, 0
     jge .ab
     neg ebx
 .ab:
     mov [w_d], ebx                 ; d = |spd| (quarter px)
-    imul ebx, SWING_RATE
-    shr ebx, 2                     ; phase advance per px
-    add ebx, [w_phase]
-    and ebx, 255
-    mov [w_phase], ebx
-    mov eax, ebx
-    call sin_q14
-    imul eax, SWING_AMP
-    sar eax, 14
-    mov [w_swing], eax
     cmp dword [w_spd], 0
     jl  .back
-    ; forward: head leads
+    ; forward: head leads along the heading (the undulation comes from the muscles)
     mov dword [w_lead], 0
     mov dword [w_dir], 1
     mov eax, [w_heading]
-    add eax, [w_swing]
-    and eax, 255
     jmp .lead
 .back:
     mov dword [w_lead], NSEG - 1
@@ -560,8 +793,6 @@ worm_move:
     mov ebx, [wx + (NSEG-1)*4]
     sub ebx, [wx + (NSEG-2)*4]
     call iatan2
-    add eax, [w_swing]
-    and eax, 255
 .lead:
     mov [w_ang], eax
     call cos_q14
@@ -645,15 +876,7 @@ worm_move:
     add eax, ebx
     cmp eax, EAT_R * EAT_R
     jae .d
-    inc dword [w_ate]
-    mov dword [w_food_on], 0
-    mov dword [w_food_timer], FOOD_RESPAWN
-    mov eax, 800                   ; high chirp
-    mov ecx, 6
-    call worm_beep
-    call bg_draw_all
-    call bg_blit_all
-    call hud_static
+    call eat_food
     ret
 .respawn:
     cmp dword [w_food_timer], 0
@@ -778,6 +1001,7 @@ place_food:
 .on:
     mov dword [w_food_on], 1
     mov dword [w_food_timer], 0
+    mov dword [w_food_amount], FOOD_AMOUNT
     call bg_draw_all
     call bg_blit_all
     call hud_static
@@ -1035,15 +1259,13 @@ worm_render:
     mov edi, [w_lfb_save]
     mov [lfb_phys], edi
     call rect
+    ; drawn positions: chain point + local normal * muscle offset
+    call drawn_positions
     ; body segments (tail first so the head is drawn on top)
     mov ecx, NSEG - 1
 .seg:
-    mov eax, [wx + ecx*4]
-    sar eax, 8
-    mov [wpx + ecx*4], eax
-    mov ebx, [wy + ecx*4]
-    sar ebx, 8
-    mov [wpy + ecx*4], ebx
+    mov eax, [wpx + ecx*4]
+    mov ebx, [wpy + ecx*4]
     movzx edx, byte [seg_width + ecx]
     mov esi, edx
     shr esi, 1
@@ -1064,6 +1286,18 @@ worm_render:
     pop ecx
     dec ecx
     jns .seg
+    ; pharynx: a dot in the head while it pumps
+    cmp dword [w_pump], 0
+    je  .nopumpdot
+    mov eax, [wpx]
+    sub eax, 2
+    mov ebx, [wpy]
+    sub ebx, 2
+    mov ecx, 4
+    mov edx, 4
+    mov esi, C_PUMP
+    call rect
+.nopumpdot:
     ; "finger" poke marker
     cmp dword [w_touch_head], 0
     jne .fh
@@ -1088,6 +1322,66 @@ worm_render:
     call raster_draw
     call muscles_draw
     call hud_status
+    ret
+
+; drawn_positions: wpx/wpy[k] = chain point k + (normal to the chain at k) * off[k]
+drawn_positions:
+    pushad
+    xor ecx, ecx
+.k:
+    mov eax, ecx
+    dec eax
+    jns .a
+    xor eax, eax
+.a:
+    mov ebx, ecx
+    inc ebx
+    cmp ebx, NSEG
+    jb  .b
+    mov ebx, NSEG - 1
+.b:
+    mov esi, [wx + eax*4]
+    sub esi, [wx + ebx*4]
+    sar esi, 8                     ; tx
+    mov edi, [wy + eax*4]
+    sub edi, [wy + ebx*4]
+    sar edi, 8                     ; ty
+    mov [w_tx], esi
+    mov [w_ty], edi
+    mov eax, esi
+    imul eax, eax
+    mov ebx, edi
+    imul ebx, ebx
+    add eax, ebx
+    push ecx                       ; isqrt clobbers ECX (the segment index)
+    call isqrt
+    pop ecx
+    test eax, eax
+    jnz .n
+    inc eax
+.n:
+    mov ebp, eax                   ; n
+    mov eax, [w_ty]
+    neg eax
+    imul eax, [w_lat + ecx*4]
+    cdq
+    idiv ebp                       ; nx = -ty*off/n
+    mov ebx, [wx + ecx*4]
+    sar ebx, 8
+    add eax, ebx
+    mov [wpx + ecx*4], eax
+    mov eax, [w_tx]
+    imul eax, [w_lat + ecx*4]
+    cdq
+    idiv ebp                       ; ny = tx*off/n
+    mov ebx, [wy + ecx*4]
+    sar ebx, 8
+    add eax, ebx
+    mov [wpy + ecx*4], eax
+    inc ecx
+    cmp ecx, NSEG
+    jb  .k
+    popad
     ret
 
 ; raster_draw: all 302 neurons, grouped sensory / inter / motor
@@ -1365,6 +1659,11 @@ hud_status:
     mov al, 'T'
 .t:
     stosb
+    mov esi, s_w_st9               ; "  PUMPS "
+    call strcpy_edi
+    mov eax, [w_pumps]
+    mov ecx, 4
+    call dec_to_edi
     mov byte [edi], 0
     ; draw the strip off-screen (no tearing on screenshots), then copy it in
     mov eax, [lfb_phys]
@@ -1530,6 +1829,12 @@ arc_serial_poll:
     mov eax, [wy + (NSEG-1)*4]
     sar eax, 8
     call .dw
+    mov eax, [w_nsm_timer]
+    call .dw
+    mov eax, [w_pumps]
+    call .dw
+    mov eax, [w_food_amount]
+    call .dw
     call ser_nl
     jmp .q
 .dw:
@@ -1568,10 +1873,11 @@ s_w_st5     db "  ", 0
 s_w_st6     db "  FOOD ", 0
 s_w_st7     db " EATEN ", 0
 s_w_st8     db "  TOUCH ", 0
+s_w_st9     db "  PUMPS ", 0
 s_w_fwd     db "FORWARD ", 0
 s_w_rev     db "REVERSE ", 0
 s_w_stop    db "PAUSED  ", 0
-s_w_g       db "worm: frame step hx hy heading drive spd fw bw th tt fx fy fon ate c gi fired tx ty = ", 0
+s_w_g       db "worm: frame step hx hy heading drive spd fw bw th tt fx fy fon ate c gi fired tx ty nsm pumps amount = ", 0
 seg_width   db 7, 8, 8, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 8, 8, 8, 7, 7, 6, 6, 5, 4, 3
 numbuf2     times 8 db 0
 statbuf     times 96 db 0
@@ -1613,4 +1919,20 @@ w_rowp      dd 0
 w_off       dd 0
 w_bar       dd 0
 w_beep      dd 0
+w_phase_head dd 0
+w_dv_slow   dd 0
+w_steer     dd 0
+w_steer_acc dd 0
+w_nsm_timer dd 0
+w_pump      dd 0
+w_pumps     dd 0
+w_food_amount dd 0
+w_md        dd 0
+w_mv        dd 0
+w_amp       dd 0
+w_hamp      dd 0
+w_bias      dd 0
+w_tx        dd 0
+w_ty        dd 0
+w_lat       times NSEG dd 0        ; per-segment lateral offset (px) from the muscles
 %include "worm/data/tables.inc"

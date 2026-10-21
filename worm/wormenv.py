@@ -28,11 +28,26 @@ W, H = 1024, 768
 DISH_CX, DISH_CY, DISH_R = 400, 400, 340      # petri dish (the right side holds the raster)
 FOOD_R = 180            # food glow radius (px)
 EAT_R = 24
-TOUCH_FRAMES = 90
+TOUCH_FRAMES = 120
 TOUCH_EXT = 300
 CHEMO_GAIN = 12         # ext per unit of concentration change (8x oversampled, 0..255 scale)
 FOOD_RESPAWN = 120      # frames after eating until a new food glow appears
 OMEGA_MIN_BACK = 16     # a reversal shorter than this (frames) ends without an omega turn
+AMP_MAX = 12            # px: max lateral wave amplitude a segment's muscles can produce
+AMP_SHIFT = 5           # amplitude = (dorsal + ventral activation) >> 5
+BIAS_SHIFT = 6          # lateral bias = (dorsal - ventral) >> 6, clamped
+BIAS_MAX = 4
+WAVE_K = 11             # phase lag per segment (angle units): ~1 wavelength over the body
+HEAD_SEGS = 4           # the head segments add a foraging sweep of their own
+HEAD_RATE = 3           # head sweep phase advance per frame
+HEAD_AMP_SHIFT = 6
+HEAD_AMP_MAX = 8
+TURN_SHIFT = 10         # heading_q4 += clamp((dorsal-ventral of head muscles, high-passed) >> 10, +-TURN_MAX)
+TURN_MAX = 4            # in 1/16 angle units per frame -> at most ~21 deg/s of muscle steering
+FOOD_ON_C = 160         # concentration above which the pharynx is driven (the bright core)
+PHARYNX_GAIN = 1        # ext to NSM/MC = concentration * gain
+NSM_SLOW_FRAMES = 30    # an NSM spike halves the speed for this many frames
+FOOD_AMOUNT = 150       # pharyngeal pumps on the food core needed to finish it
 OMEGA_TURN = 40         # heading change (angle units, 256 = 360 deg) when forward resumes after a reversal
 SWING_AMP = 46          # head swing amplitude, degrees (Q8 angle units: 256 = 360 deg)
 SWING_RATE = 6          # phase advance per px of travel (angle units)
@@ -89,7 +104,16 @@ class Worm:
         self.touch_tail = 0
         self.food_x, self.food_y = DISH_CX + 150, DISH_CY - 110
         self.food_on = 1
+        self.food_amount = FOOD_AMOUNT
         self.c_now = 0
+        self.phase_head = 0
+        self.off = [0] * NSEG
+        self.dv_slow = 0
+        self.steer = 0
+        self.steer_acc = 0
+        self.nsm_timer = 0
+        self.pump = 0
+        self.pumps = 0
         self.c_slow = 0
         self.was_back = 0
         self.back_frames = 0
@@ -131,6 +155,10 @@ class Worm:
         self.c_slow = self.c_slow - (self.c_slow >> 3) + c         # c_slow ~ 8*c, lagging
         dc = c * 8 - self.c_slow                                   # >0 rising, <0 falling
         self.c_now = c
+        if c > FOOD_ON_C:                                             # sitting on food:
+            v = min(TOUCH_EXT, c * PHARYNX_GAIN)                      # drive the pharynx
+            for k in (12, 13, 14, 15):                                # NSML NSMR MCL MCR
+                e[st[k]] = sat16(int(e[st[k]]) + v)
         if dc > 0:
             v = min(TOUCH_EXT, dc * CHEMO_GAIN)
             e[st[5]] = sat16(int(e[st[5]]) + v)                       # ASEL (ON)
@@ -149,15 +177,49 @@ class Worm:
             self.sense()
             b.step()
             fw += b.fwd_drive(); bw += b.bwd_drive()
+            st = b.stim
+            if b.fired(st[12]) or b.fired(st[13]):                    # NSM: slow down on food
+                self.nsm_timer = NSM_SLOW_FRAMES
+            if b.fired(st[14]) or b.fired(st[15]):                    # MC: a pharyngeal pump
+                self.pump = 4
+                self.pumps += 1
+                if self.food_on and self.c_now > FOOD_ON_C:            # pumping on the lawn eats it
+                    self.food_amount -= 1
+                    if self.food_amount <= 0:
+                        self.eat()
         self.fwd_acc, self.bwd_acc = fw, bw
         # smoothed drive: +fwd -bwd, in units of spikes; decays
         self.drive = self.drive - (self.drive >> DRIVE_SHIFT) + (fw - bw)
-        self.bend = self.bend - (self.bend >> DRIVE_SHIFT) + (b.head_lr() >> 4)
+        # per-segment lateral offsets from the body-wall muscles: amplitude from the
+        # total activation of that segment's muscles, bias from dorsal - ventral
+        mp = b.muscle_pairs()
+        self.off = []
+        for k in range(NSEG):
+            md, mv = mp[k]
+            amp = max(0, min(AMP_MAX, (md + mv) >> AMP_SHIFT))
+            bias = max(-BIAS_MAX, min(BIAS_MAX, (md - mv) >> BIAS_SHIFT))
+            o = ((amp * sin_q14((self.phase - k * WAVE_K) & 255)) >> 14) + bias
+            if k < HEAD_SEGS:
+                hamp = max(0, min(HEAD_AMP_MAX, (md + mv) >> HEAD_AMP_SHIFT))
+                o += (hamp * sin_q14(self.phase_head)) >> 14
+            self.off.append(o)
+        dv = sum(mp[k][0] - mp[k][1] for k in range(8))
+        self.dv_slow = self.dv_slow - (self.dv_slow >> 4) + dv                # ~16 * slow mean
+        self.steer = max(-TURN_MAX, min(TURN_MAX, (dv * 16 - self.dv_slow) >> TURN_SHIFT))   # high-passed, Q4
 
     # ---- body kinematics ----
     def move(self):
         spd = self.drive >> SPEED_SHIFT
         spd = max(-SPEED_MAX, min(SPEED_MAX, spd))
+        if self.nsm_timer:
+            self.nsm_timer -= 1
+            spd = tdiv(spd, 2)                                         # on food: slow down
+        if self.pump:
+            self.pump -= 1
+        self.phase_head = (self.phase_head + HEAD_RATE) & 255
+        self.steer_acc += self.steer                                   # head muscles steer (Q4 accumulator)
+        self.heading = (self.heading + (self.steer_acc >> 4)) & 255
+        self.steer_acc &= 15
         if spd == 0:
             return
         if spd > 0 and self.was_back:
@@ -168,16 +230,15 @@ class Worm:
         self.was_back = 1 if spd < 0 else 0
         if spd < 0:
             self.back_frames += 1
-        self.phase = (self.phase + ((abs(spd) * SWING_RATE) >> 2)) & 255
-        swing = (SWING_AMP * sin_q14(self.phase)) >> 14
+        self.phase = (self.phase + ((spd * SWING_RATE) >> 2)) & 255   # signed: a reversal runs the wave forward
         if spd > 0:
             lead, nxt, step = 0, 1, 1
-            ang = (self.heading + swing) & 255
+            ang = self.heading
         else:
             lead, nxt, step = NSEG - 1, NSEG - 2, -1
             # tail direction = from point NSEG-2 to NSEG-1
             tx = self.x[NSEG - 1] - self.x[NSEG - 2]; ty = self.y[NSEG - 1] - self.y[NSEG - 2]
-            ang = (iatan2(ty, tx) + swing) & 255
+            ang = iatan2(ty, tx)
         d = abs(spd)
         self.x[lead] += (d * cos_q14(ang)) >> 8       # quarter px * Q14 -> Q8 px
         self.y[lead] += (d * sin_q14(ang)) >> 8
@@ -214,13 +275,16 @@ class Worm:
         if self.food_on:
             dx = (self.x[0] >> 8) - self.food_x; dy = (self.y[0] >> 8) - self.food_y
             if dx * dx + dy * dy < EAT_R * EAT_R:
-                self.ate += 1
-                self.food_on = 0
-                self.food_timer = FOOD_RESPAWN
+                self.eat()
         elif self.food_timer:
             self.food_timer -= 1
             if self.food_timer == 0:
                 self.place_food(ahead=False)
+
+    def eat(self):
+        self.ate += 1
+        self.food_on = 0
+        self.food_timer = FOOD_RESPAWN
 
     def place_food(self, ahead=True):
         if ahead:
@@ -235,6 +299,7 @@ class Worm:
         if d > DISH_R - 80:
             fx = DISH_CX + tdiv(dx * (DISH_R - 80), d); fy = DISH_CY + tdiv(dy * (DISH_R - 80), d)
         self.food_x, self.food_y, self.food_on = fx, fy, 1
+        self.food_amount = FOOD_AMOUNT
 
     def frame(self):
         self.brain_frame()
@@ -243,6 +308,17 @@ class Worm:
 
     def head(self):
         return self.x[0] >> 8, self.y[0] >> 8
+
+    def drawn(self):
+        """screen positions: chain point + local normal * muscle offset (what the kernel draws)."""
+        pts = []
+        for k in range(NSEG):
+            a = max(0, k - 1); b = min(NSEG - 1, k + 1)
+            tx = (self.x[a] - self.x[b]) >> 8; ty = (self.y[a] - self.y[b]) >> 8   # tangent (px)
+            n = isqrt(tx * tx + ty * ty) or 1
+            nx = tdiv(-ty * self.off[k], n); ny = tdiv(tx * self.off[k], n)          # normal * offset
+            pts.append(((self.x[k] >> 8) + nx, (self.y[k] >> 8) + ny))
+        return pts
 
     def food_dist(self):
         hx, hy = self.head()

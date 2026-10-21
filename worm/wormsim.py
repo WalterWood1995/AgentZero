@@ -135,6 +135,14 @@ class Brain:
         dl, dr, vl, vr = self.muscles()
         return int(dl[:8].sum() + vl[:8].sum() - dr[:8].sum() - vr[:8].sum())
 
+    def muscle_pairs(self):
+        """per segment k: (dorsal, ventral) = mean of L/R rows, int."""
+        dl, dr, vl, vr = self.muscles()
+        return [((int(dl[k]) + int(dr[k])) >> 1, (int(vl[k]) + int(vr[k])) >> 1) for k in range(24)]
+
+    def fired(self, row):
+        return int(self.s[row]) != 0
+
     def head_bend(self):
         """dorsal - ventral activation of the first 8 muscle rows (steering)."""
         dl, dr, vl, vr = self.muscles()
