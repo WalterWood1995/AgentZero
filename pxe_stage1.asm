@@ -21,7 +21,7 @@ STAGE2_BYTES equ 48 * 512           ; arcade build: + game console
 %elifdef WORM
 STAGE2_BYTES equ 80 * 512           ; worm build: + petri dish + brain image
 %else
-STAGE2_BYTES equ 40 * 512           ; stage2 is padded to 40 sectors (must match stage1/stage2)
+STAGE2_BYTES equ 41 * 512           ; stage2 is padded to 41 sectors (must match stage1/stage2)
 %endif
 
 ; Scratch block at physical 0x5000 (free low memory) hands the PXE entry info to

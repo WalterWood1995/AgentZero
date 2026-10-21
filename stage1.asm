@@ -19,7 +19,7 @@ STAGE2_SECTORS equ 48          ; arcade build (must match stage2.asm)
 %elifdef WORM
 STAGE2_SECTORS equ 80          ; worm build (must match stage2.asm)
 %else
-STAGE2_SECTORS equ 40          ; must match stage2.asm / pxe_stage1.asm (sector budget)
+STAGE2_SECTORS equ 41          ; must match stage2.asm / pxe_stage1.asm (sector budget)
 %endif
 STAGE2_LBA equ 1               ; stage2 starts right after this boot sector
 

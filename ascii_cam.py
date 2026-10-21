@@ -139,9 +139,9 @@ class Renderer:
         here, the char/attribute mapping is done by the old PC's CPU)."""
         import cv2
         g = self._grid(gray)
-        lo, hi = np.percentile(g, 3), np.percentile(g, 97)
+        lo, hi = np.percentile(g, 1), np.percentile(g, 99)
         g = np.clip((g - lo) * (255.0 / max(hi - lo, 1)), 0, 255)
-        g = np.clip((g - 128) * 1.6 + 128, 0, 255)       # same contrast boost as ascii_art
+        g = np.clip((g - 128) * 1.2 + 128, 0, 255)       # mild boost: the net/table add the punch
         return cv2.resize(g.astype(np.uint8), (self.cols, self.rows), interpolation=cv2.INTER_AREA)
 
     def render(self, gray):
@@ -239,6 +239,24 @@ class Screen:
             head = cmd + b"%02X%d" % (row0 + r, 1 if last else 0)
             self.send(head + full[r:r + rpp].tobytes())
         return len(parts)
+
+    def pblock(self, lines, tiers, col, row0=0, repaint=True):
+        """p<row><col><flag> block write at a column (packed by byte budget); the last
+        packet carries the repaint flag."""
+        enc = [encode_line(ln, tl, self.legacy) for ln, tl in zip(lines, tiers)]
+        packets, cur, cur_row, size = [], [], 0, 0
+        for k, e in enumerate(enc):
+            if cur and (size + len(e) + 1 > self.max_packet or len(cur) >= self.rpp):
+                packets.append((cur_row, cur)); cur, size = [], 0
+            if not cur:
+                cur_row, size = k, 6
+            cur.append(e); size += len(e) + 1
+        if cur:
+            packets.append((cur_row, cur))
+        for i, (r, body) in enumerate(packets):
+            last = i == len(packets) - 1
+            self.send(b"p%02X%02X%d\n" % (row0 + r, col, 1 if (last and repaint) else 0) + b"\n".join(body))
+        return len(packets)
 
     def load_nn(self):
         """Put nnascii/weights.bin into the old PC's RAM (L, verified) for the 'i' command."""
@@ -348,20 +366,24 @@ def open_camera(index, width=640, height=480):
     """index = number, or -1 = auto: the first camera whose frames arrive in < 300 ms
     (a stuck DirectShow device can answer at exactly 1 frame/s - skip it)."""
     import cv2
-    for idx in ([index] if index >= 0 else [0, 1, 2, 3]):
-        cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-        if not cap.isOpened():
-            continue
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        ok, dt = True, 0.0
-        for _ in range(3):
-            t = time.time(); ok, _fr = cap.read(); dt = time.time() - t
-        if ok and (index >= 0 or dt < 0.3):
-            print("camera %d: %.0f ms/frame" % (idx, dt * 1000), flush=True)
-            return cap
-        print("camera %d: %s, skipping" % (idx, "no frame" if not ok else "%.0f ms/frame" % (dt * 1000)), flush=True)
-        cap.release()
+    # Media Foundation first: on this PC the DirectShow path of the integrated camera is
+    # held by Lenovo's virtual-camera service and only yields black 1 fps frames.
+    for api, name in ((cv2.CAP_MSMF, "msmf"), (cv2.CAP_DSHOW, "dshow")):
+        for idx in ([index] if index >= 0 else [0, 1, 2, 3]):
+            cap = cv2.VideoCapture(idx, api)
+            if not cap.isOpened():
+                continue
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+            ok, dt, fr = True, 0.0, None
+            for _ in range(4):
+                t = time.time(); ok, fr = cap.read(); dt = time.time() - t
+            live = ok and fr is not None and dt < 0.3 and float(fr.mean()) > 2.0   # not a black feed
+            if live or (index >= 0 and ok and api == cv2.CAP_DSHOW):
+                print("camera %d (%s): %.0f ms/frame, %s" % (idx, name, dt * 1000, fr.shape if fr is not None else "?"), flush=True)
+                return cap
+            print("camera %d (%s): %s, skipping" % (idx, name, "no frame" if not ok else "%.0f ms/frame mean %.1f" % (dt * 1000, float(fr.mean()) if fr is not None else -1)), flush=True)
+            cap.release()
     sys.exit("no usable camera (check Windows camera privacy settings / --list)")
 
 
@@ -409,7 +431,7 @@ def main():
                     help="send raw grey bytes; the old PC's CPU maps brightness to chars (g command)")
     ap.add_argument("--nn", action="store_true",
                     help="send raw grey bytes; the old PC's CPU runs the trained MLP (nnascii) that picks each glyph")
-    ap.add_argument("--layout", default="single", choices=["single", "dual", "brain"],
+    ap.add_argument("--layout", default="single", choices=["single", "dual", "brain", "nn"],
                     help="dual: you (36x36, left) + Dario face (right); agent_chat text fits below; "
                          "brain: you (left) + the C. elegans brain computed by the old PC (right)")
     ap.add_argument("--brain-steps", type=int, default=10, help="brain steps per video frame")
@@ -431,6 +453,10 @@ def main():
         col0 = 2 if not big else 64 - 60 - 2
     elif a.layout == "brain":                            # left square portrait, brain panel right
         a.cols = a.rows = 38 if not big else 64
+        col0 = 0
+    elif a.layout == "nn":                               # 90x90 picture by the old PC's net + model panel
+        a.nn = True
+        a.cols = a.rows = 90 if big else 48
         col0 = 0
     else:
         a.rows = a.rows or SCR_ROWS - 6
@@ -500,6 +526,11 @@ def main():
         sys.exit("could not load the NN weights into the kernel (needs pxe_cam.img with the i command)")
     if a.layout == "dual":
         scr.dario()
+    nnp = None
+    if a.layout == "nn":
+        import nn_panel
+        nnp = nn_panel.NNPanel(scr.sock, a.ip, a.port, width=SCR_COLS - a.cols - 2, height=SCR_ROWS - 1,
+                               pic_rows=a.rows, pic_cols=a.cols)
     brain = None
     if a.layout == "brain":
         import brain_panel
@@ -570,7 +601,16 @@ def main():
                     full_l.append(left + pl[r]); full_t.append(lt + pt[r])
                 lines, tiers = full_l, full_t
             if tiers is None:
+                if nnp is not None:
+                    nnp.set_probe()                       # which cell the kernel will trace
                 pk_frame = scr.gray_frame(lines, col0, cmd=b"i" if a.nn else b"g")
+                if nnp is not None:                       # read the traced computation, draw it
+                    nnp.read_trace()
+                    nnp.n = nframes
+                    pl, pt = nnp.render(fps=nframes / max(time.time() - t0, 1e-6))
+                    pr, pc = nnp.probe
+                    scr.send(b"p%02X%02X0\n\x03@" % (pr, pc))     # mark the probe cell white
+                    pk_frame += 1 + scr.pblock(pl, pt, a.cols + 2)
             else:
                 pk_frame = scr.frame(lines, tiers, col0)
             tc = time.time()

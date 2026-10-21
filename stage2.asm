@@ -47,7 +47,7 @@ STAGE2_SECTORS equ 48              ; arcade build: + game console (arcade.asm)
 %elifdef WORM
 STAGE2_SECTORS equ 80              ; worm build: + petri dish (worm.asm) + the brain image (>64 sectors: loaders copy/read in two segments)
 %else
-STAGE2_SECTORS equ 40              ; must match stage1.asm / pxe_stage1.asm (sector budget)
+STAGE2_SECTORS equ 41              ; must match stage1.asm / pxe_stage1.asm (sector budget)
 %endif
 ; The C. elegans brain primitive (brain.asm + the UDP 'n' command) is built into the
 ; default and WORM kernels. The native-NIC and arcade builds are at their sector
@@ -834,6 +834,10 @@ net_loop:
     je  .do_gray                   ;     ramp chars + 3 attributes (ascii_cam --kernel-render)
     cmp byte [rx_buf], 'i'         ; i = grey rows into the NN input grid; flag 1 = run the
     je  .do_nnin                   ;     fixed-point MLP on this CPU -> glyph per cell (--nn)
+    cmp byte [rx_buf], 'y'         ; y<8hex addr><4hex len> = raw bytes out of the compute
+    je  .do_rawread                ;     window (no console echo, unlike M) - NN trace readback
+    cmp byte [rx_buf], 'p'         ; p<2hex row><2hex col><1hex repaint>\n lines = block write
+    je  .do_pblock                 ;     at a column (side panels next to a kernel-drawn picture)
     cmp byte [rx_buf], 'L'         ; L = bulk-load raw bytes into the compute scratch RAM
     je  .do_load
     cmp byte [rx_buf], 'E'         ; E = evaluate the Fourier epicycle chain at a time step
@@ -931,12 +935,30 @@ net_loop:
 .do_block_q:                       ; b: same, but no repaint (ascii_cam frame parts)
     mov byte [blk_pres], 0
 .do_block_c:
+    mov dword [blk_col], 0
     mov byte [rain_on], 0
     mov dword [parse_ptr], rx_buf + 1
     mov bl, 2
     call phex                      ; start row
     and eax, 0x7F
     mov [blk_row], eax
+    mov esi, [parse_ptr]
+    jmp .blk_line
+.do_pblock:                        ; p<row><col><repaint flag>: block write starting at a column
+    mov byte [rain_on], 0
+    mov dword [parse_ptr], rx_buf + 1
+    mov bl, 2
+    call phex
+    and eax, 0x7F
+    mov [blk_row], eax
+    mov bl, 2
+    call phex
+    and eax, 0x7F
+    mov [blk_col], eax
+    mov bl, 1
+    call phex
+    and al, 1
+    mov [blk_pres], al
     mov esi, [parse_ptr]
 .blk_line:
     mov al, [esi]                  ; skip blank/newline separators
@@ -949,7 +971,8 @@ net_loop:
     jz  .blk_done                  ; end of packet
     mov eax, [blk_row]
     imul eax, eax, SCR_COLS
-    mov [vga_pos], eax             ; cursor = row*SCR_COLS (col 0)
+    add eax, [blk_col]
+    mov [vga_pos], eax             ; cursor = row*SCR_COLS + col
 .blk_wr:
     mov al, [esi]
     test al, al
@@ -1046,6 +1069,27 @@ net_loop:
     call nn_render
     mov byte [need_present], 1
     jmp .poll
+.do_rawread:                       ; y<8hex addr><4hex len> -> raw bytes (compute window only)
+    mov dword [parse_ptr], rx_buf + 1
+    mov bl, 8
+    call phex
+    mov esi, eax
+    mov bl, 4
+    call phex
+    mov ecx, eax
+    cmp ecx, 1400
+    jbe .rr1
+    mov ecx, 1400
+.rr1:
+    cmp esi, 0x00100000
+    jb  .poll
+    lea eax, [esi + ecx]
+    cmp eax, 0x00180000
+    ja  .poll
+    mov [tx_len], cx
+    mov edi, tx_buf
+    rep movsb
+    jmp .reply
 .do_gfxon:                         ; V: (graphics console is always on) - just ack
     mov byte [tx_buf], 1
     mov byte [tx_buf+1], 0         ; 2-byte ack: the Asus PXE ROM never transmits (or
@@ -2924,6 +2968,9 @@ NN_GRAY  equ 0x00150000            ; SCR_CELLS grey bytes (the 'i' command fills
 NN_X     equ 0x00154000            ; i32[9]  3x3 input scratch
 NN_H     equ 0x00154040            ; i32[32] hidden scratch
 NN_BEST  equ 0x001540C0            ; argmax running best / index
+NN_PROBE equ 0x001540D0            ; u32 row, u32 col: the cell whose computation is traced
+NN_OUT   equ 0x00154100            ; i32[16] output scores of the cell being computed
+NN_TRACE equ 0x00154200            ; copy of 0x154000..0x154140 taken at the probe cell
 NN_W1    equ NN_W + 28
 NN_B1    equ NN_W + 28 + 32*9*2
 NN_W2    equ NN_B1 + 32*4
@@ -3027,6 +3074,7 @@ nn_render:
     jnz .l2j
     pop ecx
     add eax, [NN_B2 + ecx*4]
+    mov [NN_OUT + ecx*4], eax
     cmp eax, [NN_BEST]
     jle .nb
     mov [NN_BEST], eax
@@ -3036,6 +3084,21 @@ nn_render:
     cmp ecx, 16
     jl  .l2
     pop ecx                        ; col
+    cmp ebx, [NN_PROBE]            ; the traced cell? snapshot x / h / best / out for the host
+    jne .ntr
+    cmp ecx, [NN_PROBE + 4]
+    jne .ntr
+    push ecx
+    push esi
+    push edi
+    mov esi, NN_X
+    mov edi, NN_TRACE
+    mov ecx, 0x140 / 4
+    rep movsd
+    pop edi
+    pop esi
+    pop ecx
+.ntr:
     mov eax, [NN_BEST + 4]
     mov al, [NN_W + 12 + eax]      ; glyph byte
     mov edx, [NN_X + 16]           ; centre grey -> attribute tier
@@ -3405,6 +3468,7 @@ tx_len    dw 0
 align 4
 blk_row   dd 0                     ; current row for B (block) writes
 blk_pres  db 1                     ; 1 = repaint after this block (B), 0 = defer (b)
+blk_col   dd 0                     ; start column for block writes (B/b: 0, p: given)
 cur_attr  db VGA_ATTR              ; attribute vga_putc writes (block ctrl bytes change it)
 attr_tab  db VGA_ATTR, 0x02, 0x0A, 0x0F   ; ctrl byte 0(unused)/1 dim/2 bright/3 white
 gray_ramp db " .:-=+*#%@"              ; g command: brightness -> char (same ramp as ascii_art.py)
