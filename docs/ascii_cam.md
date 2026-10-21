@@ -95,3 +95,15 @@ CHAT_ROW0=38 CHAT_PANE_H=10 PYTHONUTF8=1 python agent_chat.py
 PYTHONUTF8=1 python ascii_cam.py 192.168.178.114 --layout brain --fps 10 --mirror --repeat 2
 ```
 QEMU 实测 12 fps、每帧 6 包 + 1 个 L + 1 个 nS 往返、lost 0。`brain_panel.py` 可单独 import。
+
+## 6. `--nn`：老 PC 自己的神经网络生成 ASCII 画面（2026-10-21 深夜，吴总选"第二种"）
+
+- `nnascii/nnascii.py`：这台 PC 用 numpy 训练一个极小 MLP（输入 = 某格及其 3x3 邻域的 9 个灰度值，隐藏 32，输出 16 个字形 `" .:-=+*#%@/\|_^""`）。
+  标签 = 真实 8x8 像素块与老机 ROM 字体字形的二值匹配（按颜色档归一化，字形只需表达档内的明暗和形状）。
+  训练样本来自仓库里的照片多尺度切块（80 万个）。量化成定点：W1 int16(×128)，`h = clamp((W1·x + b1) >> 6, 0, 4095)`，W2 int16(×64)，argmax。
+- 内核 `i<2hex 行><1hex 运行>` + 灰度行：灰度进 NN_GRAY(0x150000)，运行标志=1 时 `nn_render` 对 128x96 每格跑一遍 MLP（标量 imul，约 1 万次/格 × 12288 格），
+  字形写文字格，颜色档按格中心亮度（<90 暗绿，<180 亮绿，否则白）。权重 blob（1820 B，`weights.bin`）由 L 装到 0x140000，魔数 "NNA1" 不在就不画。
+- `nnascii/nn_qemu_test.py`：QEMU 里把 Dario 灰度格发进去，用 `Y` 读回帧缓冲、按字体解码成字符，和 Python 参考推理逐格比：**8192 格 0 差异（位精确）**。
+  注意不能用 `M` 读文字缓冲来对账——M 的回显也会打到屏幕上把画面冲掉。
+- 用法：`python ascii_cam.py 192.168.178.114 --nn --fps 10 --max-packet 700`（先自动把权重装进老机）。QEMU（TCG）8 fps，真机原生执行预计更快。
+- 老机字体：`nnascii/font_asus.bin` 是从真机用 M 指令读回的 ROM 8x8 字体（`@` 等字形和 QEMU 不同）。
